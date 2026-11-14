@@ -1,26 +1,47 @@
-# Build status — Milestone 1.1
+# Build status — Milestone 1.2 (implementation partial; blockers remain)
 
-## Completed
+## Repository audit and preservation
 
-- Audited the existing Rust API, Python application and tests, frontend, scripts, manifests, dependencies, and SQLite schema. During testing I found that the old Python module cached `DATABASE_PATH`, causing fixtures to leak into the existing database. I backed up the database to ignored `data/neurogenesis.pre-milestone-1.1.sqlite3`, verified all 17 rows matched the two exact test prompts, then removed only those test fixtures from the active database. No other records existed, the schema was not migrated, and subsequent tests left the active database empty.
-- Replaced the single-read raw TCP server with Axum/Hyper and Tokio. Added Serde request types, bounded request bodies, bounded Python worker calls, a global request timeout, proper route/method behavior, JSON errors, structured tracing, same-origin-only access, and graceful Ctrl+C shutdown.
-- Added worker exit-code mapping for invalid requests, provider failures, and unexpected failures. Python exceptions no longer report process success.
-- Added seven Rust API test functions covering health/contracts, malformed JSON, oversize body, invalid question, unsupported tool, unavailable worker, timeout, and successful dispatch to the real Python arithmetic worker.
-- Created project-local `.venv` with Python 3.14.6 and pip; setup/dev/check/test PowerShell scripts use it where available. Setup script completed successfully.
-- Initialized Git on `main`; initial baseline commit: `a1f7191`. `.gitignore` excludes `.env`, databases/backups, virtual environments, caches, binaries, and build output.
+- Preserved Git history and existing source/data. The active SQLite database and earlier milestone backup were inspected before changes; existing legacy schema is migrated additively by Rust with a new unique online backup made before alteration. Migration preservation is covered by a test using a temporary database.
+- Existing local `.env` was checked without printing values. No model API key or model name is configured, so no real hosted inference call was attempted.
+- Existing installed toolchain: Rust/Cargo 1.99.1, MSYS2/UCRT Python 3.14.6, Node 24. `.venv` is project-local and ignored. Rust `rustfmt`/Clippy components were installed in the existing toolchain.
+- Added and locked `reqwest`, `rusqlite` (bundled SQLite + backup), `async-trait`, and supporting dependencies. Cargo registry access was intermittent; all subsequent builds use the local cache with `--offline --locked`.
+- Attempted project-local install of NumPy, SciPy, SymPy, pandas, and matplotlib. The configured package index had no compatible binary distributions for this MSYS2/UCRT Python 3.14 interpreter. No native source build was attempted; these optional numerical dependencies are a documented blocker.
 
-## Actual checks
+## Completed in this working tree
 
-- `cargo build --locked` through `scripts/setup.ps1`: passed.
-- `cargo check --offline --locked`: passed through `scripts/check.ps1`.
-- `cargo test --locked --offline`: passed; 7 Rust tests, including real Python worker dispatch.
-- Python syntax compilation and unit tests passed in `.venv`: 11 tests, including nonzero worker exit codes and SQLite persistence across separate worker processes.
-- Node `--check` on the inline frontend script: passed.
-- `cargo fmt` and `cargo clippy` could not run because `cargo-fmt.exe` and `cargo-clippy.exe` are missing. The `rustfmt` command is also only a rustup shim for the missing component. We did not retry installs because DNS to crates.io is unavailable.
-- The first setup build tried to replace an older `target/debug/neurogenesis.exe` whose ACL denied writes. The PowerShell scripts now direct Cargo output to ignored `work/cargo-target/`; the rerun of `scripts/setup.ps1` passed.
-- The Axum listener started, but HTTP health smoke testing was blocked because the environment denied access to a loopback client socket. In-process Axum `Router::oneshot` request tests pass. Browser automation and npm dependencies are not installed.
-- crates.io lookup failed with DNS resolution error. PyPI and npm registry DNS access was denied. Cached Cargo crates allowed dependencies to build offline. Official technical documentation is reachable in the browser.
+- Added a replaceable Rust `ModelProvider` trait, OpenAI-compatible asynchronous Chat Completions transport, explicit mock provider, response schema parsing with one bounded repair attempt, usage accounting, maximum calls/tokens, retries for rate limits/server failures, timeout/auth errors, and legacy token-field fallback only when an unsupported parameter is reported.
+- Rust now creates, plans, schedules selected specialist requests, dispatches allowlisted calls, synthesizes, records epistemic statuses, and owns SQLite history. The Python worker no longer has investigation/model/network/database code.
+- Added additive SQLite `user_version` migration and pre-migration online backup, plus create/update/list/search/get/delete behavior. Existing records retain their legacy result JSON.
+- Added versioned (`1.0`) Rust-to-Python tool contracts, input validation for finite numbers and singular cases, standard-library deterministic arithmetic/regression/polynomial/statistics/projectile tools.
+- Updated UI to display actual plan subproblems, specialist report text/status, tools/results/methods, verification, synthesis, uncertainty, and saved history.
+- Updated `README.md` and `ARCHITECTURE.md` with current ownership, setup, decisions, and known limitations.
 
-## Remaining work
+## Executed checks to date
 
-Rust currently owns HTTP and its typed boundary but delegates the existing investigation orchestration, optional provider transport, and SQLite operations to the Python application. The next architecture milestone should move those interfaces into Rust while retaining Python as a computation-only worker. Hosted inference was not tested with credentials. Retry/backoff, rate-limit-specific errors, scholarly retrieval, Zep, scientific third-party libraries, differential equations, Lean, uploads, and 3D visualization remain incomplete. No claim is made that these capabilities are complete.
+- `cargo fmt --all` and `cargo fmt --check`: passed.
+- `cargo build --offline --locked --target-dir work/cargo-run-2`: passed.
+- `cargo check --offline --locked`: passed.
+- `cargo test --offline --locked`: 15 passed, including provider fake-transport request/retry/auth/timeout/invalid-JSON recovery tests, SQLite legacy migration/backup and fresh-store persistence tests, API boundary tests, and an end-to-end mock investigation that executes the Python projectile worker and reads the saved investigation.
+- `cargo clippy --offline --locked --all-targets -- -D warnings`: passed.
+- Python syntax compilation and unit tests: passed (11 tests), including worker contract/version/error cases and invalid numeric inputs.
+- Extracted frontend inline JavaScript `node --check`: passed.
+- `git diff --check`: passed (only Git's expected line-ending notices on Windows).
+- Actual server startup reached the bind step, but this environment rejects loopback bind/connect operations with Windows socket error 10048. Direct health/investigation HTTP tests therefore could not run; in-process Axum request tests pass. No browser-to-backend success is claimed.
+- Startup migration ran against the existing active DB. `user_version=1`; the legacy schema was extended; row count remained 0. `data/neurogenesis.pre-m1.2.bak.sqlite3` was created, and the earlier `.pre-milestone-1.1` backup remains untouched.
+
+## Remaining before milestone completion
+
+- Obtain a Python runtime/platform with compatible scientific package wheels, then implement and test SymPy/SciPy/NumPy-based scientific tools.
+- Implement bounded parallel specialist scheduling and explicit disagreement/contradiction analysis.
+- Add genuinely independent calculation verification (current computed results are honestly marked calculated and `independently_checked=false`).
+- Exercise provider and investigation HTTP behavior via a permitted local server environment. The current managed environment blocks sockets, so this remains unverified outside in-process Router tests.
+- Add a subprocess/application-restart persistence test, rather than only reopening a Store instance in the same process.
+- Run the project scripts once more and commit the finished milestone after the remaining capabilities above are complete.
+
+## Known gaps
+
+- No real hosted inference test: credentials are absent. There is no scholarly evidence retrieval in this milestone, so external scientific claims cannot become evidence-supported.
+- Specialist calls are currently serial. Cross-domain structured disagreement aggregation, independent deterministic recalculation of tool outputs, and richer computation handoff remain incomplete.
+- Current Python tools are standard-library implementations. SymPy/SciPy/NumPy tool suite could not be installed in the available Python environment.
+- Zep, literature adapters, uploads, Lean, and 3D visualization remain later milestones.

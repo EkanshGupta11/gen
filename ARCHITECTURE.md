@@ -1,26 +1,32 @@
 # NeuroGenesis AI architecture
 
-## Repository and environment audit
+## Milestone 1.2 ownership
 
-The repository was an uninitialized source workspace with a local SQLite database at `data/neurogenesis.sqlite3`. Its table was inspected. A test-fixture isolation defect was found and fixed; a complete pre-cleanup backup is retained at ignored `data/neurogenesis.pre-milestone-1.1.sqlite3`. The 17 rows in the active database all matched known test prompts and were removed from active history; no other records existed, and the schema was not migrated. Rust 1.99/Cargo 1.99, Python 3.14.6, Node 24, and uv are present. A project-local Python virtual environment is now in `.venv` (ignored by Git). Cargo's local cache contains Axum, Tokio, Serde, Tower HTTP, and their transitive crates, so the Rust server could be upgraded and locked without network access. DNS resolution to crates.io failed; PyPI and npm registry DNS checks were denied by the environment. Official documentation remains reachable through the documentation browser.
+- **Rust (Axum/Tokio):** HTTP API, validation, investigation lifecycle and orchestration, structured plan/specialist/synthesis provider calls, specialist selection, tool allowlist, verification coordination, and SQLite history.
+- **Python:** isolated deterministic computation worker only. It accepts JSON contract version `1.0` over stdin, runs a named allowlisted calculation, and returns a versioned JSON result. It has no model credentials, network client, investigation history, or database code.
+- **Hosted provider:** replaceable `ModelProvider` abstraction. `openai_compatible` uses the documented Chat Completions JSON mode and current `max_completion_tokens` field, with bounded retries and legacy token-field fallback for explicit unsupported-parameter responses. `mock` is an explicit offline test provider and never claims hosted reasoning.
+- **SQLite:** `rusqlite` in Rust. Startup applies additive `user_version` migrations. A database with an older schema is backed up to a uniquely named `.pre-m1.2.bak.sqlite3` before migration. Investigation JSON is persisted alongside queryable status and metadata columns.
+- **Frontend:** same-origin browser workspace served by Axum and driven by actual investigation/history/settings API responses.
 
-## Milestone 1.1 decisions
+## Investigation flow
 
-- Axum/Hyper owns HTTP framing, Content-Length handling, routing, and HTTP method semantics. Tokio owns asynchronous I/O, timeouts, and graceful Ctrl+C shutdown.
-- Serde typed request contracts validate JSON at the Rust boundary. Request bodies have a configurable limit; application requests and Python worker calls are bounded by timeouts.
-- Tower HTTP supplies request-size limits and structured HTTP tracing. The UI is same-origin, so cross-origin access is disabled instead of allowing every origin.
-- The scientific worker is isolated as a child process receiving one JSON payload on stdin and a versioned route argument. Rust maps worker failures to HTTP status codes.
-- No database migration was run. SQLite remains on the existing schema behind the current Python memory implementation because rusqlite was absent from the offline Cargo cache. Moving memory and orchestration into Rust remains follow-up architecture work.
-- The Python environment uses a local `.venv`; scientific third-party packages are not installed because package registries are unreachable and the current worker has a standard-library-only fallback.
+1. Rust writes a `planning` investigation record.
+2. A structured planner call selects up to five specialist subproblems. Invalid schemas receive at most one repair request.
+3. Rust calls each selected specialist separately and validates tool names against that specialist's allowlist.
+4. Approved tool arguments are passed to Python using the versioned worker contract. Tool outputs and methods are saved as calculated results; numerical output is not experimental validation.
+5. Rust downgrades claims without matching retrieved source provenance or calculation references. No scholarly retrieval is configured in this milestone, so unsupported model claims remain hypotheses.
+6. A separate synthesis call produces a concise report. SQLite persists intermediate and final workflow state.
 
-## Current component ownership
+Execution is bounded by a per-request provider timeout, at most five specialist roles, a logical-call/token budget, bounded HTTP retries, and a server request timeout. Model prompts ask for concise conclusions and do not request hidden chain-of-thought. No generated command or code is executed.
 
-- **Rust:** HTTP API, request validation, bounded worker dispatch, service logs, and graceful shutdown.
-- **Python:** current investigation orchestration, optional OpenAI-compatible HTTP call, scientific tool implementations, and SQLite history adapter. This is a known transition state; the target is Rust orchestration/provider/memory interfaces with Python limited to computation.
-- **Frontend:** dependency-free same-origin browser UI served from the Rust binary.
+## SQLite choice
 
-## Request flow
+`rusqlite` is a maintained, direct SQLite binding with bundled SQLite and online backup support. It keeps persistence local to the Rust application, avoids a separate database service, and provides a backup API before schema changes. Python's former database schema (`id`, `question`, `created_at`, `result`) is extended additively so legacy records remain queryable.
 
-Browser → Axum API and typed contracts → bounded Python worker process → scientific computation / current investigation and SQLite adapter → JSON response.
+## Current limitations
 
-There is no network CORS policy because the production UI is served from the API origin. Hosted inference is only attempted when explicitly configured. No secrets are compiled into the UI.
+- Hosted inference has not been tested: the local environment has no configured model key. Provider transport, retries, usage parsing, authentication and timeout paths are tested with injected fake transport.
+- SQLite fallback is available. Zep, scholarly retrieval, Lean, document ingestion, and 3D visualization belong to later milestones.
+- Python's current tools use the standard library (arithmetic, regression fit, polynomial evaluation, descriptive statistics, projectile motion). NumPy, SciPy, SymPy, pandas and plotting packages could not be installed in this environment: the existing virtual environment is MSYS2/UCRT Python 3.14, for which the configured package index supplied no compatible prebuilt wheels. No native source build was attempted.
+- Specialist execution is bounded and separate per selected role but currently serial. Concurrency scheduling, evidence retrieval, and independent cross-specialist contradiction modeling remain future work.
+- No browser-to-server smoke test is claimed until loopback access is verified in this environment.

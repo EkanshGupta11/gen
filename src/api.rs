@@ -16,6 +16,7 @@ use crate::{
         ErrorResponse, HealthResponse, HistoryRequest, InvestigationRequest, SettingsRequest,
         ToolRequest,
     },
+    orchestrator::Orchestrator,
     worker::{self, WorkerError},
 };
 
@@ -27,6 +28,7 @@ pub struct AppState {
     pub worker_script: PathBuf,
     pub worker_timeout: Duration,
     pub max_request_bytes: usize,
+    pub orchestrator: std::sync::Arc<Orchestrator>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -36,6 +38,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/investigate", post(investigate))
         .route("/api/history", post(history))
+        .route(
+            "/api/investigations/{id}",
+            get(get_investigation).delete(delete_investigation),
+        )
         .route("/api/tool", post(tool))
         .route("/api/settings", post(settings))
         .fallback(not_found)
@@ -73,7 +79,10 @@ async fn investigate(
             "Question must contain 8–4000 characters",
         );
     }
-    dispatch(state, "/api/investigate", json!({"question": question})).await
+    match state.orchestrator.investigate(question.to_owned()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error_response(StatusCode::BAD_GATEWAY, "investigation_failed", &error),
+    }
 }
 
 async fn history(
@@ -84,7 +93,56 @@ async fn history(
         Ok(payload) => payload,
         Err(error) => return json_rejection(error),
     };
-    dispatch(state, "/api/history", json!({"q": payload.q.unwrap_or_default()})).await
+    match state
+        .orchestrator
+        .store
+        .list(payload.q, payload.limit.unwrap_or(50))
+        .await
+    {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database_error",
+            &error.to_string(),
+        ),
+    }
+}
+
+async fn get_investigation(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.orchestrator.store.get(id).await {
+        Ok(Some(item)) => Json(item.result).into_response(),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            "investigation_not_found",
+            "Investigation was not found",
+        ),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database_error",
+            &error.to_string(),
+        ),
+    }
+}
+async fn delete_investigation(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.orchestrator.store.delete(id).await {
+        Ok(true) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Ok(false) => error_response(
+            StatusCode::NOT_FOUND,
+            "investigation_not_found",
+            "Investigation was not found",
+        ),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database_error",
+            &error.to_string(),
+        ),
+    }
 }
 
 async fn tool(
@@ -95,7 +153,13 @@ async fn tool(
         Ok(payload) => payload,
         Err(error) => return json_rejection(error),
     };
-    const ALLOWED_TOOLS: [&str; 5] = ["arithmetic", "power_law", "polynomial", "projectile", "statistics"];
+    const ALLOWED_TOOLS: [&str; 5] = [
+        "arithmetic",
+        "power_law",
+        "polynomial",
+        "projectile",
+        "statistics",
+    ];
     if !ALLOWED_TOOLS.contains(&payload.name.as_str()) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -118,23 +182,8 @@ async fn settings(
     if let Err(error) = request {
         return json_rejection(error);
     }
-    let body = json!({
-        "model_provider": std::env::var("MODEL_PROVIDER").unwrap_or_else(|_| "mock".into()),
-        "memory_provider": std::env::var("MEMORY_PROVIDER").unwrap_or_else(|_| "sqlite".into()),
-        "hosted_ready": std::env::var("MODEL_API_KEY").is_ok_and(|key| !key.is_empty())
-    });
-    match worker::invoke(
-        state.python,
-        state.worker_script,
-        "/api/settings",
-        body,
-        state.worker_timeout,
-    )
-    .await
-    {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => worker_error(error),
-    }
+    let settings = state.orchestrator.provider.settings();
+    Json(json!({"model_provider":settings.model_provider,"model_name":settings.model_name,"memory_provider":"sqlite","hosted_ready":settings.credentials_configured,"max_tokens_per_request":settings.max_tokens_per_request})).into_response()
 }
 
 async fn dispatch(state: AppState, route: &'static str, payload: Value) -> Response {
@@ -199,7 +248,7 @@ async fn not_found() -> Response {
 }
 
 async fn request_timeout(request: Request<axum::body::Body>, next: Next) -> Response {
-    match tokio::time::timeout(Duration::from_secs(60), next.run(request)).await {
+    match tokio::time::timeout(Duration::from_secs(300), next.run(request)).await {
         Ok(response) => response,
         Err(_) => error_response(
             StatusCode::GATEWAY_TIMEOUT,
@@ -212,6 +261,7 @@ async fn request_timeout(request: Request<axum::body::Body>, next: Next) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{provider, store::Store};
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use serde_json::Value;
@@ -223,6 +273,19 @@ mod tests {
             worker_script: PathBuf::from("engine/app.py"),
             worker_timeout: Duration::from_secs(2),
             max_request_bytes: 262_144,
+            orchestrator: {
+                let path =
+                    std::env::temp_dir().join(format!("ng-api-{}.sqlite3", uuid::Uuid::new_v4()));
+                let (store, _) = Store::initialize(path).unwrap();
+                let bundle = provider::from_environment().unwrap();
+                std::sync::Arc::new(Orchestrator {
+                    store,
+                    provider: bundle.provider,
+                    python: "python".into(),
+                    worker_script: PathBuf::from("engine/app.py"),
+                    worker_timeout: Duration::from_secs(2),
+                })
+            },
         }
     }
 
@@ -230,7 +293,10 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     #[tokio::test]
@@ -262,7 +328,10 @@ mod tests {
         limited.max_request_bytes = 64;
         let request = Request::post("/api/investigate")
             .header("content-type", "application/json")
-            .body(Body::from(format!("{{\"question\":\"{}\"}}", "x".repeat(100))))
+            .body(Body::from(format!(
+                "{{\"question\":\"{}\"}}",
+                "x".repeat(100)
+            )))
             .unwrap();
         let response = router(limited).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -291,7 +360,9 @@ mod tests {
     async fn executes_allowlisted_tool_in_python_worker() {
         let request = Request::post("/api/tool")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"arithmetic","args":{"a":20,"b":22}}"#))
+            .body(Body::from(
+                r#"{"name":"arithmetic","args":{"a":20,"b":22}}"#,
+            ))
             .unwrap();
         let (status, body) = send(router(state()), request).await;
         assert_eq!(status, StatusCode::OK);

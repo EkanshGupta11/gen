@@ -1,19 +1,31 @@
 # NeuroGenesis AI
 
-An offline-first scientific investigation workspace with deterministic local tools, scientific role selection, epistemic labels, and persistent SQLite history. Mock activity is explicitly labeled as role selection; it does not claim that an agent performed an analysis.
+An offline-capable scientific investigation workspace. Rust owns investigation planning, selected specialist requests, hosted-model communication, scientific-tool dispatch, verification coordination, and persistent investigation history. Python runs deterministic calculations. The browser shows saved plans, specialist outputs, calculations, epistemic status, and synthesis.
 
-## Quick start (Windows PowerShell)
+## Windows quick start
 
-Requirements: stable Rust/Cargo, Python 3.11+, and a modern browser. Node is not required for the dependency-free UI. Run `./scripts/setup.ps1`, then `./scripts/dev.ps1`, and open http://127.0.0.1:8787. Setup creates a project-local `.venv`; local databases and secrets are excluded from Git.
+Requirements: stable Rust with `rustfmt` and `clippy`, Python 3.11 or later, and a modern browser. Node.js is not required for the current dependency-free frontend.
 
-To configure the optional hosted provider, set `MODEL_PROVIDER=openai_compatible`, `MODEL_BASE_URL`, `MODEL_API_KEY`, and `MODEL_NAME` in local `.env`. Questions are sent to that provider when configured. Do not submit sensitive research unless the provider's data handling is acceptable. This network-dependent path has not been tested with credentials in the current environment.
+1. Run `scripts/setup.ps1` once.
+2. Keep `MODEL_PROVIDER=mock` for offline mode, or configure `MODEL_PROVIDER=openai_compatible`, `MODEL_BASE_URL`, `MODEL_API_KEY`, and `MODEL_NAME` in local `.env`.
+3. Run `scripts/dev.ps1` and open http://127.0.0.1:8787.
 
-## Current features
+The mock provider exercises the workflow without credentials but explicitly labels all outputs as mock and performs no hosted scientific reasoning. Deterministic tool calls still run locally. Hosted questions are sent to the configured service; do not submit sensitive material unless its data handling is acceptable. API keys stay server-side.
 
-- Axum/Tokio Rust HTTP API with typed requests, request-size limits, worker timeouts, structured errors, request tracing, and graceful shutdown.
-- Distinct mathematics, physics, chemistry, biology, and medicinal-science roles. Offline mode reports role selection without claiming completed specialist analysis.
-- Python tools for arithmetic, power-law fitting, polynomial evaluation, descriptive statistics, and ideal projectile motion.
-- Local SQLite history with search and restart persistence.
-- Epistemic labels for calculations and hypotheses, plus a responsive same-origin research UI.
+## Current capabilities
 
-Rust currently serves the typed API and dispatches to the existing Python application, which still owns investigation orchestration, hosted-provider transport, and SQLite operations. Moving these boundaries into Rust remains a follow-up milestone. See [ARCHITECTURE.md](ARCHITECTURE.md), [DEVELOPMENT.md](DEVELOPMENT.md), and the `docs/` directory for design details and known limitations.
+- Stable Rust/Axum API and orchestrator with typed request/response structures.
+- Configurable OpenAI-compatible hosted provider, structured JSON parsing, bounded retries, request/token limits, timeout/rate-limit handling, and offline mock transport.
+- Five specialist instructions and structured outputs. Only selected specialists are called, with an independent provider call per role.
+- Versioned Python worker with arithmetic, power-law fit, polynomial evaluation, statistics, and ideal projectile motion.
+- Rust-owned SQLite history with additive migrations, pre-migration backup, investigation retrieval, search, and deletion.
+- Explicit epistemic status; unsupported claims are not marked evidence-supported or verified.
+- Responsive, same-origin research workspace rendering actual API results.
+
+## Checks
+
+Run `scripts/check.ps1` for formatting, Rust checks and Python syntax; `scripts/test.ps1` runs Rust and Python tests. The offline Rust integration test performs planning, specialist routing, a real Python projectile computation, synthesis, and persistence.
+
+## Limitations
+
+Live model inference is untested because this environment has no configured key. The existing MSYS2/UCRT Python 3.14 environment had no compatible prebuilt wheels for NumPy/SciPy/SymPy/pandas/matplotlib from its configured package index, so the current tools stay standard-library based. Specialist calls are serial and there is no live scholarly retrieval yet. Zep, uploads, Lean, and 3D visualization are later milestones. See [ARCHITECTURE.md](ARCHITECTURE.md), [DEVELOPMENT.md](DEVELOPMENT.md), and [BUILD_STATUS.md](BUILD_STATUS.md).

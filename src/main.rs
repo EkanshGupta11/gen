@@ -1,10 +1,15 @@
 mod api;
 mod contracts;
+mod orchestrator;
+mod provider;
+mod store;
 mod worker;
 
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
-use api::{router, AppState};
+use api::{AppState, router};
+use orchestrator::Orchestrator;
+use store::Store;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -17,9 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port: u16 = env::var("PORT")
-        .unwrap_or_else(|_| "8787".into())
-        .parse()?;
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8787".into()).parse()?;
     let max_request_bytes: usize = env::var("MAX_REQUEST_BYTES")
         .unwrap_or_else(|_| "262144".into())
         .parse()?;
@@ -39,11 +42,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("engine/app.py"));
 
+    let database = env::var("DATABASE_PATH").unwrap_or_else(|_| "data/neurogenesis.sqlite3".into());
+    let (store, backup) = Store::initialize(database)?;
+    if let Some(path) = backup {
+        tracing::info!(path=%path.display(), "Created pre-migration SQLite backup");
+    }
+    let provider = provider::from_environment()?;
+    let orchestrator = std::sync::Arc::new(Orchestrator {
+        store,
+        provider: provider.provider,
+        python: python.clone(),
+        worker_script: worker_script.clone(),
+        worker_timeout,
+    });
     let state = AppState {
         python,
         worker_script,
         worker_timeout,
         max_request_bytes,
+        orchestrator,
     };
     let app = router(state);
 
