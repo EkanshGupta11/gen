@@ -191,7 +191,11 @@ mod tests {
         let (store, _) =
             Store::initialize(directory.path().join("investigations.sqlite3")).unwrap();
         let python = if cfg!(windows) {
-            ".venv/bin/python.exe"
+            if std::path::Path::new(".venv-cpython313/Scripts/python.exe").exists() {
+                ".venv-cpython313/Scripts/python.exe"
+            } else {
+                ".venv/bin/python.exe"
+            }
         } else {
             "python3"
         };

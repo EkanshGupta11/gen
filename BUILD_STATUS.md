@@ -1,47 +1,75 @@
-# Build status — Milestone 1.2 (implementation partial; blockers remain)
+# Build status — Milestone 1.2: Local Development Environment & End-to-End Validation
 
 ## Repository audit and preservation
 
-- Preserved Git history and existing source/data. The active SQLite database and earlier milestone backup were inspected before changes; existing legacy schema is migrated additively by Rust with a new unique online backup made before alteration. Migration preservation is covered by a test using a temporary database.
-- Existing local `.env` was checked without printing values. No model API key or model name is configured, so no real hosted inference call was attempted.
-- Existing installed toolchain: Rust/Cargo 1.99.1, MSYS2/UCRT Python 3.14.6, Node 24. `.venv` is project-local and ignored. Rust `rustfmt`/Clippy components were installed in the existing toolchain.
-- Added and locked `reqwest`, `rusqlite` (bundled SQLite + backup), `async-trait`, and supporting dependencies. Cargo registry access was intermittent; all subsequent builds use the local cache with `--offline --locked`.
-- Attempted project-local install of NumPy, SciPy, SymPy, pandas, and matplotlib. The configured package index had no compatible binary distributions for this MSYS2/UCRT Python 3.14 interpreter. No native source build was attempted; these optional numerical dependencies are a documented blocker.
+- Preserved Git history and user data. Working branch `env-validation` created from `main`.
+- Real user SQLite database (`data/neurogenesis.sqlite3`) and pre-migration backups (`neurogenesis.pre-m1.2.bak.sqlite3`, `neurogenesis.pre-milestone-1.1.sqlite3`) remain intact. All automated persistence tests run against isolated temporary databases.
+- Existing local `.env` checked without logging secrets. Hosted credentials (`MODEL_API_KEY`) remain unconfigured, so offline mock mode is active for safe deterministic testing.
 
-## Completed in this working tree
+## Local Environment & Python Toolchain (Completed)
 
-- Added a replaceable Rust `ModelProvider` trait, OpenAI-compatible asynchronous Chat Completions transport, explicit mock provider, response schema parsing with one bounded repair attempt, usage accounting, maximum calls/tokens, retries for rate limits/server failures, timeout/auth errors, and legacy token-field fallback only when an unsupported parameter is reported.
-- Rust now creates, plans, schedules selected specialist requests, dispatches allowlisted calls, synthesizes, records epistemic statuses, and owns SQLite history. The Python worker no longer has investigation/model/network/database code.
-- Added additive SQLite `user_version` migration and pre-migration online backup, plus create/update/list/search/get/delete behavior. Existing records retain their legacy result JSON.
-- Added versioned (`1.0`) Rust-to-Python tool contracts, input validation for finite numbers and singular cases, standard-library deterministic arithmetic/regression/polynomial/statistics/projectile tools.
-- Updated UI to display actual plan subproblems, specialist report text/status, tools/results/methods, verification, synthesis, uncertainty, and saved history.
-- Updated `README.md` and `ARCHITECTURE.md` with current ownership, setup, decisions, and known limitations.
+- **Astral uv installed & active:** uv 0.12.10 (x86_64-pc-windows-msvc).
+- **Managed CPython 3.13 installed:** CPython 3.13.15 installed via uv at `C:\Users\Ekansh\AppData\Roaming\uv\python\cpython-3.13.15-windows-x86_64-none\python.exe`.
+- **Project-local virtual environment:** Created dedicated `.venv-cpython313` virtual environment using standard CPython 3.13, isolating the project from the previous MSYS2/UCRT Python 3.14 environment.
+- **Scientific packages installed & verified:**
+  - `numpy==2.5.4`
+  - `scipy==1.18.1`
+  - `sympy==1.14.0`
+  - `pandas==3.1.1`
+  - `matplotlib==3.11.2`
+  - Verified package imports and versions via `.venv-cpython313/Scripts/python.exe`.
+- **Reproducible dependency metadata & scripts:**
+  - Created `requirements.txt` locking scientific dependencies.
+  - Updated `scripts/setup.ps1` to detect `uv`, provision CPython 3.13, create `.venv-cpython313`, and install from `requirements.txt`.
+  - Updated `scripts/dev.ps1`, `scripts/test.ps1`, and `scripts/check.ps1` to resolve `.venv-cpython313/Scripts/python.exe`.
+  - Updated `.env` and `.env.example` with `PYTHON_EXECUTABLE=.venv-cpython313/Scripts/python.exe`.
+  - Updated `.gitignore` to ignore `.venv-cpython313/`.
 
-## Executed checks to date
+## Local Application Testing & HTTP Communication (Completed)
 
-- `cargo fmt --all` and `cargo fmt --check`: passed.
-- `cargo build --offline --locked --target-dir work/cargo-run-2`: passed.
-- `cargo check --offline --locked`: passed.
-- `cargo test --offline --locked`: 15 passed, including provider fake-transport request/retry/auth/timeout/invalid-JSON recovery tests, SQLite legacy migration/backup and fresh-store persistence tests, API boundary tests, and an end-to-end mock investigation that executes the Python projectile worker and reads the saved investigation.
-- `cargo clippy --offline --locked --all-targets -- -D warnings`: passed.
-- Python syntax compilation and unit tests: passed (11 tests), including worker contract/version/error cases and invalid numeric inputs.
-- Extracted frontend inline JavaScript `node --check`: passed.
-- `git diff --check`: passed (only Git's expected line-ending notices on Windows).
-- Actual server startup reached the bind step, but this environment rejects loopback bind/connect operations with Windows socket error 10048. Direct health/investigation HTTP tests therefore could not run; in-process Axum request tests pass. No browser-to-backend success is claimed.
-- Startup migration ran against the existing active DB. `user_version=1`; the legacy schema was extended; row count remained 0. `data/neurogenesis.pre-m1.2.bak.sqlite3` was created, and the earlier `.pre-milestone-1.1` backup remains untouched.
+- **Configured HTTP Port:** Inspected `.env` (`HOST=127.0.0.1`, `PORT=8787`).
+- **Port Collision Resolution:** Identified Windows socket error 10048 was caused by a prior instance of `neurogenesis.exe` (PID 36412) holding port 8787. Safely terminated the orphaned process; loopback bind succeeded without OS restrictions.
+- **Live HTTP Health Checks:**
+  - `GET /health` -> HTTP 200 `{"status":"ok","contract_version":"1.0","mode":"offline-capable"}`
+  - `GET /api/health` -> HTTP 200 `{"status":"ok","contract_version":"1.0","mode":"offline-capable"}`
+  - `POST /api/settings` -> HTTP 200 `{"hosted_ready":false,"max_tokens_per_request":1200,"memory_provider":"sqlite","model_name":"offline-mock","model_provider":"mock"}`
+- **Live Investigation Submission:**
+  - `POST /api/investigate` -> HTTP 200, successfully orchestrated planning, specialist routing, executed Python calculation tool (`projectile` returning `range_m = 38.33`), synthesized findings, and persisted record.
+- **Browser-to-Backend End-to-End Verification:**
+  - Executed automated Chrome DevTools Protocol (CDP) test (`scripts/test_browser_e2e.js`) with headless Chrome.
+  - Verified frontend loaded from `http://127.0.0.1:8787/`.
+  - Verified badge dynamically updated to "Offline mock mode" after fetching `/api/settings`.
+  - Submitted an investigation via the UI form; verified browser DOM received and rendered research plan, specialist reports, tool outputs, and synthesis.
+  - Verified sidebar history populated with saved investigations.
 
-## Remaining before milestone completion
+## Cross-Process Database Persistence & Recovery (Completed)
 
-- Obtain a Python runtime/platform with compatible scientific package wheels, then implement and test SymPy/SciPy/NumPy-based scientific tools.
-- Implement bounded parallel specialist scheduling and explicit disagreement/contradiction analysis.
-- Add genuinely independent calculation verification (current computed results are honestly marked calculated and `independently_checked=false`).
-- Exercise provider and investigation HTTP behavior via a permitted local server environment. The current managed environment blocks sockets, so this remains unverified outside in-process Router tests.
-- Add a subprocess/application-restart persistence test, rather than only reopening a Store instance in the same process.
-- Run the project scripts once more and commit the finished milestone after the remaining capabilities above are complete.
+- **Automated recovery test (`scripts/test_persistence_recovery.py`):**
+  - Generated isolated temporary SQLite database in temp directory.
+  - Launched server process 1 and submitted an investigation via HTTP POST.
+  - Verified investigation completion and persistence in SQLite.
+  - Terminated server process 1.
+  - Launched independent server process 2 pointing to the same database.
+  - Queried `/api/history` and `GET /api/investigations/{id}` on server process 2; verified exact ID, calculation output (`range_m = 38.33`), and synthesis survived process termination.
+  - Terminated server process 2 and cleanly removed temporary files.
+  - Verified zero modification or deletion of real user data.
 
-## Known gaps
+## Executed Checks and Test Suite Results
 
-- No real hosted inference test: credentials are absent. There is no scholarly evidence retrieval in this milestone, so external scientific claims cannot become evidence-supported.
-- Specialist calls are currently serial. Cross-domain structured disagreement aggregation, independent deterministic recalculation of tool outputs, and richer computation handoff remain incomplete.
-- Current Python tools are standard-library implementations. SymPy/SciPy/NumPy tool suite could not be installed in the available Python environment.
-- Zep, literature adapters, uploads, Lean, and 3D visualization remain later milestones.
+- `cargo fmt --check`: passed (0 formatting violations).
+- `cargo clippy --locked --all-targets -- -D warnings`: passed (0 warnings, 0 errors).
+- `cargo check --locked --offline`: passed.
+- `cargo test --locked --offline`: 15 passed, 0 failed.
+- Python unit test suite (`unittest discover -s engine` with CPython 3.13): 11 passed, 0 failed.
+- Frontend inline JavaScript syntax check (`node --check`): passed.
+- Cross-process database recovery test (`scripts/test_persistence_recovery.py`): passed.
+- Browser end-to-end verification (`scripts/test_browser_e2e.js`): passed.
+
+## Remaining Before Next Milestone
+
+- Implement bounded parallel specialist scheduling (currently serial).
+- Implement explicit cross-specialist disagreement/contradiction aggregation.
+- Implement independent calculation verification (current computed results are marked calculated with `independently_checked=false`).
+- Integrate real hosted model inference once API credentials are provided.
+- Integrate scholarly evidence retrieval (e.g. OpenAlex/Crossref) to enable `evidence_supported` claims.
+- Zep long-term memory, document ingestion, Lean theorem proving, and 3D molecular visualization belong to future milestones.
