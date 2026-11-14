@@ -2,12 +2,12 @@
 
 ## Completed
 
-- Audited the existing Rust API, Python application and tests, frontend, scripts, manifests, dependencies, and SQLite schema. The existing `data/neurogenesis.sqlite3` was preserved without migration or row edits.
+- Audited the existing Rust API, Python application and tests, frontend, scripts, manifests, dependencies, and SQLite schema. During testing I found that the old Python module cached `DATABASE_PATH`, causing fixtures to leak into the existing database. I backed up the database to ignored `data/neurogenesis.pre-milestone-1.1.sqlite3`, verified all 17 rows matched the two exact test prompts, then removed only those test fixtures from the active database. No other records existed, the schema was not migrated, and subsequent tests left the active database empty.
 - Replaced the single-read raw TCP server with Axum/Hyper and Tokio. Added Serde request types, bounded request bodies, bounded Python worker calls, a global request timeout, proper route/method behavior, JSON errors, structured tracing, same-origin-only access, and graceful Ctrl+C shutdown.
 - Added worker exit-code mapping for invalid requests, provider failures, and unexpected failures. Python exceptions no longer report process success.
 - Added seven Rust API test functions covering health/contracts, malformed JSON, oversize body, invalid question, unsupported tool, unavailable worker, timeout, and successful dispatch to the real Python arithmetic worker.
 - Created project-local `.venv` with Python 3.14.6 and pip; setup/dev/check/test PowerShell scripts use it where available. Setup script completed successfully.
-- Initialized Git on `main`. This verified source state is the initial baseline; `.gitignore` excludes `.env`, databases, virtual environments, caches, binaries, and build output.
+- Initialized Git on `main`; initial baseline commit: `a1f7191`. `.gitignore` excludes `.env`, databases/backups, virtual environments, caches, binaries, and build output.
 
 ## Actual checks
 

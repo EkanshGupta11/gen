@@ -6,7 +6,8 @@ class ProviderError(Exception): pass
 class ApiError(Exception): pass
 ROLES={"mathematics":"Check mathematical structure and quantitative claims.","physics":"Assess physical principles, assumptions, and model limits.","chemistry":"Assess chemical concepts and reaction reasoning.","biology":"Assess biological mechanisms and evidence needs.","medicinal_science":"Assess pharmacology and translational drug research context."}
 def db():
- os.makedirs(os.path.dirname(DB) or '.',exist_ok=True); c=sqlite3.connect(DB); c.execute('CREATE TABLE IF NOT EXISTS investigations(id TEXT PRIMARY KEY, question TEXT, created_at TEXT, result TEXT)'); c.commit(); return c
+ database_path=os.getenv('DATABASE_PATH',DB)
+ os.makedirs(os.path.dirname(database_path) or '.',exist_ok=True); c=sqlite3.connect(database_path); c.execute('CREATE TABLE IF NOT EXISTS investigations(id TEXT PRIMARY KEY, question TEXT, created_at TEXT, result TEXT)'); c.commit(); return c
 def tool(name,args):
  if name=='arithmetic':
   a=float(args['a']); b=float(args['b']); op=args.get('op','add'); v={"add":a+b,"subtract":a-b,"multiply":a*b,"divide":a/b if b else None}.get(op)

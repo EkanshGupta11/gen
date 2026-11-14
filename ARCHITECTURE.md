@@ -2,7 +2,7 @@
 
 ## Repository and environment audit
 
-The repository was an uninitialized source workspace with an existing local SQLite database at `data/neurogenesis.sqlite3`. Its `investigations` table was inspected and left unchanged. Rust 1.99/Cargo 1.99, Python 3.14.6, Node 24, and uv are present. A project-local Python virtual environment is now in `.venv` (ignored by Git). Cargo's local cache contains Axum, Tokio, Serde, Tower HTTP, and their transitive crates, so the Rust server could be upgraded and locked without network access. DNS resolution to crates.io failed; PyPI and npm registry DNS checks were denied by the environment. Official documentation remains reachable through the documentation browser.
+The repository was an uninitialized source workspace with a local SQLite database at `data/neurogenesis.sqlite3`. Its table was inspected. A test-fixture isolation defect was found and fixed; a complete pre-cleanup backup is retained at ignored `data/neurogenesis.pre-milestone-1.1.sqlite3`. The 17 rows in the active database all matched known test prompts and were removed from active history; no other records existed, and the schema was not migrated. Rust 1.99/Cargo 1.99, Python 3.14.6, Node 24, and uv are present. A project-local Python virtual environment is now in `.venv` (ignored by Git). Cargo's local cache contains Axum, Tokio, Serde, Tower HTTP, and their transitive crates, so the Rust server could be upgraded and locked without network access. DNS resolution to crates.io failed; PyPI and npm registry DNS checks were denied by the environment. Official documentation remains reachable through the documentation browser.
 
 ## Milestone 1.1 decisions
 

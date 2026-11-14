@@ -12,6 +12,8 @@ The actual offline Cargo checks and test suite pass using cached Axum/Tokio/Serd
 
 The application can be started, but this environment blocks loopback HTTP client access; API behavior is covered with in-process Axum request tests instead. Browser automation packages are not installed, and npm registry access is unavailable.
 
+Test isolation uses temporary SQLite paths. A previous Python module-level path cache caused fixture rows to be written to the active database; this was fixed, and the test fixture rows were backed up before removal. Restore `data/neurogenesis.pre-milestone-1.1.sqlite3` only if you need the pre-cleanup snapshot.
+
 ## Known limitations
 
 - Rust currently provides the typed HTTP gateway and worker boundary, while investigation orchestration, hosted provider transport, and SQLite remain in `engine/app.py`. Moving those interfaces into Rust is the next architecture milestone.
