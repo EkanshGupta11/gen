@@ -17,6 +17,7 @@
 - Python syntax compilation and unit tests passed in `.venv`: 11 tests, including nonzero worker exit codes and SQLite persistence across separate worker processes.
 - Node `--check` on the inline frontend script: passed.
 - `cargo fmt` and `cargo clippy` could not run because `cargo-fmt.exe` and `cargo-clippy.exe` are missing. The `rustfmt` command is also only a rustup shim for the missing component. We did not retry installs because DNS to crates.io is unavailable.
+- The first setup build tried to replace an older `target/debug/neurogenesis.exe` whose ACL denied writes. The PowerShell scripts now direct Cargo output to ignored `work/cargo-target/`; the rerun of `scripts/setup.ps1` passed.
 - The Axum listener started, but HTTP health smoke testing was blocked because the environment denied access to a loopback client socket. In-process Axum `Router::oneshot` request tests pass. Browser automation and npm dependencies are not installed.
 - crates.io lookup failed with DNS resolution error. PyPI and npm registry DNS access was denied. Cached Cargo crates allowed dependencies to build offline. Official technical documentation is reachable in the browser.
 
