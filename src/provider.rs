@@ -951,4 +951,39 @@ mod tests {
         assert_eq!(budget.model_call_count(), 2);
         assert_eq!(transport.requests().len(), 2);
     }
+
+    #[tokio::test]
+    async fn retries_server_500_error_with_bounded_retry() {
+        let server_error = Ok(TransportResponse {
+            status: 503,
+            headers: vec![],
+            body: r#"{"error":{"message":"Engine overloaded"}}"#.into(),
+        });
+        let (provider, transport) = test_provider(vec![
+            server_error,
+            successful_response("{\"recovered\":true}"),
+        ]);
+        let budget = RequestBudget::new(250);
+        budget.begin_logical_call().unwrap();
+        let result = provider.complete(request(), &budget).await.unwrap();
+        assert_eq!(result.content, "{\"recovered\":true}");
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn enforces_token_budget_exhaustion() {
+        let (provider, _) = test_provider(vec![successful_response("{\"ok\":true}")]);
+        let budget = RequestBudget::new(10); // Very small token limit
+        budget.begin_logical_call().unwrap();
+        let _result = provider.complete(request(), &budget).await.unwrap();
+        // Result claims 17 total tokens, which exceeds max_total_tokens (10 * 16 = 160, wait: 10 * 16 = 160).
+        // Let's record usage that exceeds limit:
+        let huge_usage = Some(ModelUsage {
+            prompt_tokens: 100,
+            completion_tokens: 100,
+            total_tokens: 200,
+        });
+        let err = budget.record_usage(huge_usage).unwrap_err();
+        assert!(matches!(err, ModelError::BudgetExhausted));
+    }
 }

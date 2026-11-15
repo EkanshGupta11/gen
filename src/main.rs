@@ -3,6 +3,7 @@ mod contracts;
 mod orchestrator;
 mod provider;
 mod store;
+mod verification;
 mod worker;
 
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
@@ -47,6 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = backup {
         tracing::info!(path=%path.display(), "Created pre-migration SQLite backup");
     }
+    let max_concurrency: usize = env::var("SPECIALIST_CONCURRENCY")
+        .unwrap_or_else(|_| "3".into())
+        .parse::<usize>()
+        .unwrap_or(3)
+        .clamp(1, 5);
     let provider = provider::from_environment()?;
     let orchestrator = std::sync::Arc::new(Orchestrator {
         store,
@@ -54,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         python: python.clone(),
         worker_script: worker_script.clone(),
         worker_timeout,
+        max_concurrency,
     });
     let state = AppState {
         python,

@@ -1,75 +1,100 @@
-# Build status — Milestone 1.2: Local Development Environment & End-to-End Validation
+# Build Status — Milestone 1.2.1: Scientific Reliability and Intelligence Validation
 
-## Repository audit and preservation
+## Repository & Environment Audit
 
-- Preserved Git history and user data. Working branch `env-validation` created from `main`.
-- Real user SQLite database (`data/neurogenesis.sqlite3`) and pre-migration backups (`neurogenesis.pre-m1.2.bak.sqlite3`, `neurogenesis.pre-milestone-1.1.sqlite3`) remain intact. All automated persistence tests run against isolated temporary databases.
-- Existing local `.env` checked without logging secrets. Hosted credentials (`MODEL_API_KEY`) remain unconfigured, so offline mock mode is active for safe deterministic testing.
+- **Branch:** `m1.2-reliability` created from clean state on `env-validation`.
+- **Database Integrity:** Real user database (`data/neurogenesis.sqlite3`) and pre-migration backups remain completely intact and unmodified. All automated tests run against isolated temporary SQLite databases.
+- **Python Environment:** Standard CPython 3.13 virtual environment (`.venv-cpython313`) managed by Astral `uv` with pre-installed scientific dependencies: `numpy 2.5.4`, `scipy 1.18.1`, `sympy 1.14.0`, `pandas 3.1.1`, `matplotlib 3.11.2`.
+- **Hosted Model Credentials:** Safely inspected `.env` without printing secrets. `MODEL_API_KEY` is empty; live hosted inference remains honestly marked as untested. Offline mock mode (`MODEL_PROVIDER=mock`) is active for deterministic testing.
 
-## Local Environment & Python Toolchain (Completed)
+---
 
-- **Astral uv installed & active:** uv 0.12.10 (x86_64-pc-windows-msvc).
-- **Managed CPython 3.13 installed:** CPython 3.13.15 installed via uv at `C:\Users\Ekansh\AppData\Roaming\uv\python\cpython-3.13.15-windows-x86_64-none\python.exe`.
-- **Project-local virtual environment:** Created dedicated `.venv-cpython313` virtual environment using standard CPython 3.13, isolating the project from the previous MSYS2/UCRT Python 3.14 environment.
-- **Scientific packages installed & verified:**
-  - `numpy==2.5.4`
-  - `scipy==1.18.1`
-  - `sympy==1.14.0`
-  - `pandas==3.1.1`
-  - `matplotlib==3.11.2`
-  - Verified package imports and versions via `.venv-cpython313/Scripts/python.exe`.
-- **Reproducible dependency metadata & scripts:**
-  - Created `requirements.txt` locking scientific dependencies.
-  - Updated `scripts/setup.ps1` to detect `uv`, provision CPython 3.13, create `.venv-cpython313`, and install from `requirements.txt`.
-  - Updated `scripts/dev.ps1`, `scripts/test.ps1`, and `scripts/check.ps1` to resolve `.venv-cpython313/Scripts/python.exe`.
-  - Updated `.env` and `.env.example` with `PYTHON_EXECUTABLE=.venv-cpython313/Scripts/python.exe`.
-  - Updated `.gitignore` to ignore `.venv-cpython313/`.
+## Milestone 1.2.1 Completed Deliverables
 
-## Local Application Testing & HTTP Communication (Completed)
+### Phase 1: Independent Scientific Verification
+- **Typed Verification Result (`src/contracts.rs`):**
+  - Created `VerificationResult` struct containing: `id`, `subject_id`, `status`, `method`, `details`, `independently_checked`, `checker`, `original_calculation`, `independently_calculated`, `absolute_error`, `relative_error`, `comparison_tolerance`, `explanation`, and `verified_at`.
+  - Supported epistemic statuses: `verified`, `calculated`, `evidence_supported`, `hypothesis`, `uncertain`, and `contradicted`.
+  - **Rule Enforced:** A model is strictly prohibited from assigning `verified` status to its own outputs or unverified calculations.
+- **Independent Rust Checkers (`src/verification.rs`):**
+  - **Priority 1 (Projectile Motion):** Closed-form Newtonian kinematics derived in Rust ($R = v^2 \sin(2\theta)/g$, $T = 2v \sin\theta/g$, $H = v^2 \sin^2\theta / (2g)$). Comprehensive input validation ($v \ge 0$, $g > 0$, finite inputs), boundary condition validation ($\theta = 0^\circ, 90^\circ$), corrupted output detection, and floating-point tolerance comparisons ($10^{-6}$).
+  - **Priority 2 (Arithmetic):** Exact integer and float validation for addition, subtraction, multiplication, and division; division by zero safely caught and classified.
+  - **Priority 3 (Descriptive Statistics):** Independent computation of sample mean, Bessel-corrected sample standard deviation ($N-1$), min, max, and count; rejection of empty samples and $N < 2$.
+  - **Priority 4 (Power-Law Fitting Consistency):** Evaluated against least-squares normal equations ($\sum e_i = 0$, $\sum (\ln x_i) e_i = 0$). Consistent empirical fits retain **`calculated`** status with `independently_checked = false`. Violations or non-physical parameters are marked **`contradicted`**.
 
-- **Configured HTTP Port:** Inspected `.env` (`HOST=127.0.0.1`, `PORT=8787`).
-- **Port Collision Resolution:** Identified Windows socket error 10048 was caused by a prior instance of `neurogenesis.exe` (PID 36412) holding port 8787. Safely terminated the orphaned process; loopback bind succeeded without OS restrictions.
-- **Live HTTP Health Checks:**
-  - `GET /health` -> HTTP 200 `{"status":"ok","contract_version":"1.0","mode":"offline-capable"}`
-  - `GET /api/health` -> HTTP 200 `{"status":"ok","contract_version":"1.0","mode":"offline-capable"}`
-  - `POST /api/settings` -> HTTP 200 `{"hosted_ready":false,"max_tokens_per_request":1200,"memory_provider":"sqlite","model_name":"offline-mock","model_provider":"mock"}`
-- **Live Investigation Submission:**
-  - `POST /api/investigate` -> HTTP 200, successfully orchestrated planning, specialist routing, executed Python calculation tool (`projectile` returning `range_m = 38.33`), synthesized findings, and persisted record.
-- **Browser-to-Backend End-to-End Verification:**
-  - Executed automated Chrome DevTools Protocol (CDP) test (`scripts/test_browser_e2e.js`) with headless Chrome.
-  - Verified frontend loaded from `http://127.0.0.1:8787/`.
-  - Verified badge dynamically updated to "Offline mock mode" after fetching `/api/settings`.
-  - Submitted an investigation via the UI form; verified browser DOM received and rendered research plan, specialist reports, tool outputs, and synthesis.
-  - Verified sidebar history populated with saved investigations.
+### Phase 2: Verification Integration & UI
+- Integrated verification directly into the orchestrator workflow (`src/orchestrator.rs`).
+- Flow: Python worker executes tool -> Rust receives output -> Rust invokes independent checker -> `VerificationResult` generated -> Persisted to SQLite -> Frontend displays status.
+- Updated `web/index.html` to visually distinguish all six epistemic statuses with custom semantic badges:
+  - `.pill-verified` (green)
+  - `.pill-calculated` (blue)
+  - `.pill-evidence_supported` (purple)
+  - `.pill-hypothesis` (amber)
+  - `.pill-uncertain` (gray)
+  - `.pill-contradicted` (red)
+- Unchecked calculations never receive a green `verified` badge.
 
-## Cross-Process Database Persistence & Recovery (Completed)
+### Phase 3: Specialist Execution Improvements
+- Implemented bounded asynchronous specialist scheduling with dynamic DAG dependency resolution in `src/orchestrator.rs`.
+- Configurable concurrency via `SPECIALIST_CONCURRENCY` (range 1..=5, default 3).
+- Serial execution mode when `SPECIALIST_CONCURRENCY <= 1`.
+- Failure isolation: Failures in individual specialist models or tool calls are isolated to that specialist's report, allowing concurrent sibling tasks and synthesis to proceed.
+- Distinct model requests per specialist role when hosted inference is configured.
 
-- **Automated recovery test (`scripts/test_persistence_recovery.py`):**
-  - Generated isolated temporary SQLite database in temp directory.
-  - Launched server process 1 and submitted an investigation via HTTP POST.
-  - Verified investigation completion and persistence in SQLite.
-  - Terminated server process 1.
-  - Launched independent server process 2 pointing to the same database.
-  - Queried `/api/history` and `GET /api/investigations/{id}` on server process 2; verified exact ID, calculation output (`range_m = 38.33`), and synthesis survived process termination.
-  - Terminated server process 2 and cleanly removed temporary files.
-  - Verified zero modification or deletion of real user data.
+### Phase 4: Model Provider Validation
+- Inspected `.env` safely. No live API credentials found; real hosted inference is marked as untested without inventing mock successes.
+- Provider test suite validates request formatting, authentication header handling, token budget enforcement, 500/503 server error retries with bounded exponential backoff, rate limit handling, and legacy token parameter fallback.
 
-## Executed Checks and Test Suite Results
+---
 
-- `cargo fmt --check`: passed (0 formatting violations).
-- `cargo clippy --locked --all-targets -- -D warnings`: passed (0 warnings, 0 errors).
-- `cargo check --locked --offline`: passed.
-- `cargo test --locked --offline`: 15 passed, 0 failed.
-- Python unit test suite (`unittest discover -s engine` with CPython 3.13): 11 passed, 0 failed.
-- Frontend inline JavaScript syntax check (`node --check`): passed.
-- Cross-process database recovery test (`scripts/test_persistence_recovery.py`): passed.
-- Browser end-to-end verification (`scripts/test_browser_e2e.js`): passed.
+## Test Execution Results
 
-## Remaining Before Next Milestone
+All checks and tests were executed in the native Windows development environment:
 
-- Implement bounded parallel specialist scheduling (currently serial).
-- Implement explicit cross-specialist disagreement/contradiction aggregation.
-- Implement independent calculation verification (current computed results are marked calculated with `independently_checked=false`).
-- Integrate real hosted model inference once API credentials are provided.
-- Integrate scholarly evidence retrieval (e.g. OpenAlex/Crossref) to enable `evidence_supported` claims.
-- Zep long-term memory, document ingestion, Lean theorem proving, and 3D molecular visualization belong to future milestones.
+| Test Suite / Check | Command | Result | Details |
+| :--- | :--- | :--- | :--- |
+| **Rust Formatting** | `cargo fmt --check` | **PASSED** | 0 formatting violations |
+| **Rust Compilation** | `cargo check` | **PASSED** | 0 errors |
+| **Clippy Linter** | `cargo clippy --locked --all-targets -- -D warnings` | **PASSED** | 0 warnings, 0 errors |
+| **Rust Test Suite** | `cargo test --locked` | **PASSED** | **26 passed, 0 failed, 0 ignored** |
+| **Python Test Suite** | `.venv-cpython313\Scripts\python.exe -m unittest discover -s engine -p "test_*.py" -v` | **PASSED** | **11 passed, 0 failed** (0.41s) |
+| **Frontend Syntax** | `node --check` | **PASSED** | Valid inline JavaScript syntax |
+| **Persistence Recovery** | `python scripts/test_persistence_recovery.py` | **PASSED** | Verified SQLite persistence across process restarts, tool outputs, and verification records |
+| **Browser E2E Verification** | `node scripts/test_browser_e2e.js` | **PASSED** | Headless Chrome verified UI loading, investigation execution, DOM rendering, and `.pill.pill-verified` badges |
+
+### Summary of the 26 Rust Tests:
+1. `provider::tests::enforces_token_budget_exhaustion` (passed)
+2. `provider::tests::maps_auth_and_timeout_failures_without_revealing_credentials` (passed)
+3. `provider::tests::handles_rate_limit_with_one_bounded_retry` (passed)
+4. `provider::tests::retries_invalid_structured_json_once_then_fails_honestly` (passed)
+5. `provider::tests::retries_only_for_unsupported_new_token_parameter_with_legacy_fallback` (passed)
+6. `provider::tests::sends_current_openai_compatible_chat_request_and_accounts_usage` (passed)
+7. `provider::tests::retries_server_500_error_with_bounded_retry` (passed)
+8. `api::tests::health_reports_contract_version` (passed)
+9. `verification::tests::test_arithmetic_verification` (passed)
+10. `verification::tests::test_power_law_retains_calculated_when_consistent_and_contradicts_when_invalid` (passed)
+11. `verification::tests::test_projectile_detects_corrupted_output` (passed)
+12. `api::tests::unavailable_worker_is_reported` (passed)
+13. `verification::tests::test_projectile_rejects_invalid_inputs` (passed)
+14. `api::tests::rejects_oversized_body` (passed)
+15. `verification::tests::test_projectile_verification_different_angles_and_velocities` (passed)
+16. `verification::tests::test_projectile_verification_boundary_zero_and_90_degrees` (passed)
+17. `verification::tests::test_statistics_verification` (passed)
+18. `api::tests::rejects_malformed_json_as_json_error` (passed)
+19. `api::tests::rejects_short_question_and_disallowed_tool` (passed)
+20. `store::tests::migrates_legacy_schema_with_backup_and_preserves_rows` (passed)
+21. `store::tests::persists_updates_and_retrieves_from_a_fresh_store_instance` (passed)
+22. `api::tests::worker_timeout_is_reported` (passed)
+23. `api::tests::executes_allowlisted_tool_in_python_worker` (passed)
+24. `orchestrator::tests::specialist_failure_isolation_test` (passed)
+25. `orchestrator::tests::offline_investigation_runs_plan_specialist_tool_synthesis_and_persists` (passed)
+26. `orchestrator::tests::serial_specialist_execution_mode` (passed)
+
+---
+
+## Remaining Blockers and Limitations
+
+- **Live Hosted Model Inference:** Untested pending user-provided API credentials.
+- **Scholarly Literature Retrieval:** OpenAlex, Crossref, and PubMed integrations belong to subsequent milestones to support `evidence_supported` claims.
+- **Formal Mathematical Theorem Proving:** Lean 4 integration is designed as a future verification extension.
+- **Long-Term Memory & 3D Visualization:** Zep memory, Mol* 3D molecular visualization, and document ingestion are slated for future milestones.

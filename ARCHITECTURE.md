@@ -1,32 +1,97 @@
-# NeuroGenesis AI architecture
+# NeuroGenesis AI Architecture
 
-## Milestone 1.2 ownership
+## System Boundaries & Component Ownership
 
-- **Rust (Axum/Tokio):** HTTP API, validation, investigation lifecycle and orchestration, structured plan/specialist/synthesis provider calls, specialist selection, tool allowlist, verification coordination, and SQLite history.
-- **Python:** isolated deterministic computation worker only. It accepts JSON contract version `1.0` over stdin, runs a named allowlisted calculation, and returns a versioned JSON result. It has no model credentials, network client, investigation history, or database code.
-- **Hosted provider:** replaceable `ModelProvider` abstraction. `openai_compatible` uses the documented Chat Completions JSON mode and current `max_completion_tokens` field, with bounded retries and legacy token-field fallback for explicit unsupported-parameter responses. `mock` is an explicit offline test provider and never claims hosted reasoning.
-- **SQLite:** `rusqlite` in Rust. Startup applies additive `user_version` migrations. A database with an older schema is backed up to a uniquely named `.pre-m1.2.bak.sqlite3` before migration. Investigation JSON is persisted alongside queryable status and metadata columns.
-- **Frontend:** same-origin browser workspace served by Axum and driven by actual investigation/history/settings API responses.
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Rust Core (Axum / Tokio)                        │
+│                                                                        │
+│  ┌───────────────────────┐   ┌──────────────────────────────────────┐  │
+│  │   HTTP & Static API   │   │      Investigation Orchestrator      │  │
+│  │    (Contracts 1.0)    │   │  - Planning & Synthesis Routing      │  │
+│  └───────────┬───────────┘   │  - Bounded Asynchronous Scheduler    │  │
+│              │               │    (Tokio JoinSet, Concurrency 1..5) │  │
+│              │               └──────────────────┬───────────────────┘  │
+│              │                                  │                      │
+│              │       ┌──────────────────────────┴───────────────┐      │
+│              │       │       Independent Verification Engine    │      │
+│              │       │  - Newtonian Ballistics Derivation       │      │
+│              │       │  - Exact Arithmetic Validation           │      │
+│              │       │  - Descriptive Statistics Invariants     │      │
+│              │       │  - Power-Law Least-Squares Normal Eqns   │      │
+│              │       └──────────────────────────┬───────────────┘      │
+│              │                                  │                      │
+│  ┌───────────▼───────────┐                      │                      │
+│  │   SQLite Store        │◄─────────────────────┘                      │
+│  │   (rusqlite, backup)  │                                             │
+│  └───────────────────────┘                                             │
+└──────────────┬──────────────────────────────────┬──────────────────────┘
+               │                                  │
+     (Versioned JSON Stdin/Stdout)         (HTTP / JSON Mode)
+               │                                  │
+               ▼                                  ▼
+┌───────────────────────────────┐  ┌─────────────────────────────────────┐
+│  Python Scientific Worker     │  │  Model Provider                     │
+│  (CPython 3.13 Virtualenv)    │  │  - OpenAI-compatible hosted API     │
+│  - NumPy, SciPy, SymPy        │  │  - Offline deterministic mock       │
+│  - Allowlisted Tools Only     │  │  - Bounded retries & token budget   │
+└───────────────────────────────┘  └─────────────────────────────────────┘
+```
 
-## Investigation flow
+### 1. Rust Application Core (`Axum`, `Tokio`, `rusqlite`)
+- **Orchestration & Workflow:** Owns planning, specialist dispatch, tool execution coordination, synthesis, and final status classification.
+- **Independent Verification:** Natively executes closed-form analytical verifications in Rust, completely independent of the Python worker.
+- **Bounded Asynchronous Scheduler:** Manages specialist concurrency via `tokio::task::JoinSet` with configurable limits (`SPECIALIST_CONCURRENCY`, 1..=5, default 3). Resolves subproblem dependency DAGs dynamically and isolates task failures.
+- **Persistence:** Direct SQLite integration with additive schema migrations, automatic pre-migration snapshots, and cross-process database recovery.
 
-1. Rust writes a `planning` investigation record.
-2. A structured planner call selects up to five specialist subproblems. Invalid schemas receive at most one repair request.
-3. Rust calls each selected specialist separately and validates tool names against that specialist's allowlist.
-4. Approved tool arguments are passed to Python using the versioned worker contract. Tool outputs and methods are saved as calculated results; numerical output is not experimental validation.
-5. Rust downgrades claims without matching retrieved source provenance or calculation references. No scholarly retrieval is configured in this milestone, so unsupported model claims remain hypotheses.
-6. A separate synthesis call produces a concise report. SQLite persists intermediate and final workflow state.
+### 2. Python Scientific Computation Worker (`engine/app.py`)
+- **Execution Model:** Subprocess executed within a dedicated CPython 3.13 virtual environment (`.venv-cpython313`). Communicates over stdin/stdout using versioned JSON contract `1.0`.
+- **Role:** Pure mathematical and scientific calculations.
+- **Security & Isolation:** Has no network access, model credentials, file system write permissions, or database connections. Cannot execute arbitrary code or shell commands.
 
-Execution is bounded by a per-request provider timeout, at most five specialist roles, a logical-call/token budget, bounded HTTP retries, and a server request timeout. Model prompts ask for concise conclusions and do not request hidden chain-of-thought. No generated command or code is executed.
+### 3. Model Provider Transport (`src/provider.rs`)
+- **Interface:** Abstract `ModelProvider` trait supporting `openai_compatible` and `mock`.
+- **Reliability:** Enforces structured JSON output matching requested schemas, bounded retries on 500/503 server errors with exponential backoff, rate limit handling, and token budgets.
+- **Mock Mode:** Explicitly labels outputs as mock and performs no hosted scientific analysis.
 
-## SQLite choice
+---
 
-`rusqlite` is a maintained, direct SQLite binding with bundled SQLite and online backup support. It keeps persistence local to the Rust application, avoids a separate database service, and provides a backup API before schema changes. Python's former database schema (`id`, `question`, `created_at`, `result`) is extended additively so legacy records remain queryable.
+## The Investigation Lifecycle
 
-## Current limitations
+1. **Planning Stage:**
+   - Rust creates an initial `Investigation` record in SQLite with status `Planning`.
+   - The planner decomposes the question into up to 5 specialist subproblems with explicit `id`, `specialist`, `task`, `depends_on`, and `required_tools` fields.
+2. **Specialist Execution Stage:**
+   - Subproblems are scheduled based on `SPECIALIST_CONCURRENCY`. If concurrency $\le 1$, subproblems run sequentially; otherwise, independent ready subproblems run in parallel.
+   - For each specialist, a distinct prompt is submitted to the model provider with role instructions.
+   - Specialist tool calls are validated against the role's allowlist (up to 3 tool calls per specialist).
+   - Tool arguments are dispatched to the Python worker.
+   - Python worker results are immediately routed into the Rust independent verification engine.
+   - Verification results are recorded with exact errors, tolerances, and status (`verified`, `calculated`, `contradicted`, or `uncertain`).
+   - SQLite is updated after each specialist completes to guarantee crash resilience.
+3. **Synthesis Stage:**
+   - The synthesis stage receives specialist reports, executed tool outputs, and verification results.
+   - **Epistemic Classification Rules:**
+     - A model cannot self-assign `verified` or `evidence_supported`.
+     - Claims referencing independently verified tools receive `verified`.
+     - Claims referencing unverified calculations receive `calculated`.
+     - Claims lacking source backing or verified calculations remain `hypothesis`.
+   - Final report is persisted to SQLite with status `Completed`.
 
-- Hosted inference has not been tested: the local environment has no configured model key. Provider transport, retries, usage parsing, authentication and timeout paths are tested with injected fake transport.
-- SQLite fallback is available. Zep, scholarly retrieval, Lean, document ingestion, and 3D visualization belong to later milestones.
-- Python's current tools use the standard library (arithmetic, regression fit, polynomial evaluation, descriptive statistics, projectile motion). NumPy, SciPy, SymPy, pandas and plotting packages could not be installed in this environment: the existing virtual environment is MSYS2/UCRT Python 3.14, for which the configured package index supplied no compatible prebuilt wheels. No native source build was attempted.
-- Specialist execution is bounded and separate per selected role but currently serial. Concurrency scheduling, evidence retrieval, and independent cross-specialist contradiction modeling remain future work.
-- No browser-to-server smoke test is claimed until loopback access is verified in this environment.
+---
+
+## Concurrency and Scheduling Rules
+
+1. **Bound Limits:** `SPECIALIST_CONCURRENCY` is clamped to $1 \le C \le 5$.
+2. **Dependency Resolution:** A subproblem is only scheduled when all dependencies in its `depends_on` list have completed.
+3. **Deadlock Prevention:** Unsatisfied or cyclic dependencies are drained and recorded with `status: Failed`.
+4. **Failure Isolation:** A model timeout or tool failure in one specialist does not abort concurrent tasks or prevent synthesis.
+
+---
+
+## Current Status and Limitations
+
+- **Hosted Model Credentials:** Safely verified; none configured in `.env`. Offline mock mode is fully operational.
+- **Scholarly Literature Retrieval:** OpenAlex, Crossref, and PubMed integrations will be added in subsequent milestones to support `evidence_supported` claims.
+- **Formal Verification:** Lean 4 integration is designed as an extension point for formal mathematical proofs.
+- **Long-Term Memory:** Zep conversational memory is planned for future milestones.

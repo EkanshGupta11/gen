@@ -158,8 +158,14 @@ def run_recovery_test():
         assert recovered.get("status") == "completed", "Recovered status mismatch"
         assert len(recovered.get("tools", [])) == 1, "Recovered tools mismatch"
         assert abs(recovered["tools"][0]["output"]["range_m"] - range_val) < 1e-6, "Recovered calculation mismatch"
+        assert recovered["tools"][0]["epistemic_status"] == "verified", f"Tool epistemic status: {recovered['tools'][0]['epistemic_status']}"
+        assert len(recovered.get("verification", [])) >= 1, "Recovered verification records missing"
+        v0 = recovered["verification"][0]
+        assert v0["status"] == "verified", f"Verification status: {v0['status']}"
+        assert v0["checker"] == "rust_independent_projectile_checker", f"Checker: {v0['checker']}"
         assert recovered.get("synthesis"), "Recovered synthesis missing"
         print("  Direct GET /api/investigations/{id} recovery: OK")
+        print(f"  Verified epistemic status: {recovered['tools'][0]['epistemic_status']} (checker: {v0['checker']})")
         print(f"  Recovered synthesis summary: {recovered['synthesis']['executive_summary']}")
         print("\n>>> CROSS-PROCESS PERSISTENCE & DATABASE RECOVERY TEST: PASSED <<<")
 

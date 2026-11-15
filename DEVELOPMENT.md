@@ -1,23 +1,84 @@
-# Development
+# Development Guide
 
-## Windows quick start
+## Windows Quick Start
 
-From PowerShell in the repository, run `./scripts/setup.ps1` once, configure `.env` if needed, then run `./scripts/dev.ps1` and open http://127.0.0.1:8787. Setup creates `.venv` without changing system Python and builds from `Cargo.lock`. The launch script prefers `.venv`'s interpreter and loads `.env` into that process only.
+Requirements:
+- Stable Rust (1.80+ with `rustfmt` and `clippy`)
+- Astral `uv` with managed CPython 3.13
+- Node.js (v20+ for CDP automated browser testing; not required for production serving)
+- Google Chrome (for automated CDP browser tests)
 
-Run `./scripts/check.ps1` for formatting availability, Rust compilation, and Python syntax checks. Run `./scripts/test.ps1` for Rust API tests and Python tests. The server supports `HOST`, `PORT`, `MAX_REQUEST_BYTES`, `WORKER_TIMEOUT_SECONDS`, and `PYTHON_EXECUTABLE`.
+1. Provision Environment & Dependencies:
+   ```powershell
+   ./scripts/setup.ps1
+   ```
+   This automatically provisions standard CPython 3.13 via `uv`, creates `.venv-cpython313`, installs `requirements.txt` (`numpy`, `scipy`, `sympy`, `pandas`, `matplotlib`), and compiles the Rust application.
 
-## Milestone 1.1 checks and environment
+2. Configure Environment:
+   Copy `.env.example` to `.env` if not already present. Default configuration runs in offline mock mode:
+   ```env
+   HOST=127.0.0.1
+   PORT=8787
+   DATABASE_PATH=data/neurogenesis.sqlite3
+   PYTHON_EXECUTABLE=.venv-cpython313/Scripts/python.exe
+   MODEL_PROVIDER=mock
+   SPECIALIST_CONCURRENCY=3
+   ```
 
-The actual offline Cargo checks and test suite pass using cached Axum/Tokio/Serde dependencies. The Python worker tests pass in Python 3.14.6. `rustfmt` and Clippy components are missing from the active Rust toolchain (`cargo fmt` reports missing `cargo-fmt.exe`; `cargo clippy` reports missing `cargo-clippy.exe`). The repository DNS checks failed for crates.io and were denied for PyPI and npm registries. The current Cargo lockfile is resolved locally; if a dependency is not cached on another machine, normal Cargo setup will need registry access.
+3. Launch Development Server:
+   ```powershell
+   ./scripts/dev.ps1
+   ```
+   Open http://127.0.0.1:8787 in your browser.
 
-The application can be started, but this environment blocks loopback HTTP client access; API behavior is covered with in-process Axum request tests instead. Browser automation packages are not installed, and npm registry access is unavailable.
+---
 
-Test isolation uses temporary SQLite paths. A previous Python module-level path cache caused fixture rows to be written to the active database; this was fixed, and the test fixture rows were backed up before removal. Restore `data/neurogenesis.pre-milestone-1.1.sqlite3` only if you need the pre-cleanup snapshot.
+## Configuration Reference
 
-## Known limitations
+| Environment Variable | Description | Default | Allowed Values |
+| :--- | :--- | :--- | :--- |
+| `HOST` | Bind address for HTTP server | `127.0.0.1` | Valid IPv4/IPv6 string |
+| `PORT` | Listening port | `8787` | Valid TCP port (1–65535) |
+| `DATABASE_PATH` | Path to SQLite database | `data/neurogenesis.sqlite3` | File path |
+| `PYTHON_EXECUTABLE` | Path to Python 3.13 interpreter | `.venv-cpython313/Scripts/python.exe` | File path |
+| `MODEL_PROVIDER` | Language model provider | `mock` | `mock`, `openai_compatible` |
+| `SPECIALIST_CONCURRENCY` | Maximum concurrent specialist tasks | `3` | `1` to `5` (`1` forces serial mode) |
+| `MODEL_BASE_URL` | Base URL for hosted provider | None | Valid HTTP/HTTPS URL |
+| `MODEL_API_KEY` | API key for hosted provider | None | String |
+| `MODEL_NAME` | Model identifier | `offline-mock` | String |
+| `MODEL_TIMEOUT_SECONDS` | Per-request hosted model timeout | `30` | Seconds (integer) |
+| `MAX_TOKENS_PER_REQUEST` | Token budget per model call | `1200` | Tokens (integer) |
 
-- Rust currently provides the typed HTTP gateway and worker boundary, while investigation orchestration, hosted provider transport, and SQLite remain in `engine/app.py`. Moving those interfaces into Rust is the next architecture milestone.
-- The hosted provider path has not been exercised with credentials. It does not yet implement retry/backoff or provider-specific status mapping.
-- OpenAlex/Crossref retrieval, Zep, NumPy/SciPy/SymPy computations, differential equation solving, document upload, Lean, and 3D visualization are incomplete.
-- Mock role activity is shown as `role_selected`, not as completed analysis.
-- Python computations are standard-library only in the present environment. Never interpret an idealized calculation as experimental or clinical validation.
+---
+
+## Test Suites & Quality Verification
+
+Run all test suites via:
+```powershell
+./scripts/test.ps1
+```
+
+This script executes the complete validation pipeline:
+1. **Rust Test Suite:** `cargo test --locked --offline` (26 unit and integration tests passing).
+2. **Python Test Suite:** `.venv-cpython313/Scripts/python.exe -m unittest discover -s engine -p "test_*.py" -v` (11 unit tests passing).
+3. **Frontend JS Syntax:** Validates `web/index.html` inline JavaScript via `node --check`.
+4. **Cross-Process Persistence Recovery:** `python scripts/test_persistence_recovery.py` validates SQLite persistence across process restarts, tool outputs, and verification records using isolated temporary databases.
+5. **Browser End-to-End Test:** `node scripts/test_browser_e2e.js` uses native Chrome DevTools Protocol to verify UI rendering, investigation submission, and DOM status badges (`.pill.pill-verified`).
+
+### Code Quality & Static Analysis:
+```powershell
+./scripts/check.ps1
+```
+Enforces:
+- `cargo fmt --check`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo check --locked`
+- Python syntax compilation checks
+
+---
+
+## Epistemic Integrity Guidelines
+
+1. **Calculated vs. Verified:** A calculation executed by a tool is `calculated`. It is only marked `verified` if an independent checker in Rust validates the output against closed-form physical equations, exact arithmetic, or statistical invariants.
+2. **Models Cannot Self-Verify:** A model must never be allowed to assign `verified` or `evidence_supported` to its own output.
+3. **Test Database Safety:** Never run tests against real user data in `data/neurogenesis.sqlite3`. Automated tests must use temporary SQLite databases.

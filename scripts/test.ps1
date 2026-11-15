@@ -29,3 +29,6 @@ if match:
 
 Write-Host "`n=== 4. Cross-Process Persistence Recovery Test ==="
 & $venvPython scripts/test_persistence_recovery.py
+
+Write-Host "`n=== 5. Browser End-to-End Verification ==="
+node scripts/test_browser_e2e.js

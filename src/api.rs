@@ -284,6 +284,7 @@ mod tests {
                     python: "python".into(),
                     worker_script: PathBuf::from("engine/app.py"),
                     worker_timeout: Duration::from_secs(2),
+                    max_concurrency: 2,
                 })
             },
         }

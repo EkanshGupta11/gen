@@ -100,6 +100,20 @@ pub enum EpistemicStatus {
     Contradicted,
 }
 
+impl EpistemicStatus {
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::EvidenceSupported => "evidence_supported",
+            Self::Calculated => "calculated",
+            Self::Hypothesis => "hypothesis",
+            Self::Uncertain => "uncertain",
+            Self::Contradicted => "contradicted",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvestigationPlan {
@@ -198,6 +212,22 @@ pub struct VerificationResult {
     pub method: String,
     pub details: String,
     pub independently_checked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_calculation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independently_calculated: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absolute_error: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_error: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_tolerance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
