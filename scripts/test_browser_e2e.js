@@ -180,3 +180,4 @@ runBrowserTest().then(() => process.exit(0)).catch(err => {
     console.error('Browser test failed:', err);
     process.exit(1);
 });
+
