@@ -1,18 +1,36 @@
+# Environment & secrets
 .env
-.venv/
-.venv-cpython313/
+.env.*
+!.env.example
+
+# Virtual environments
 venv/
+.venv/
+.venv-*/
+.venv-cpython313/
+
+# Rust build artifacts & target directories
 target/
 work/
-work/cargo-target/
+*.pdb
+
+# Local application databases & user data
 data/
 *.sqlite
 *.sqlite3
 *.db
+
+# Python bytecode & test caches
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+
+# Node / frontend build output
 node_modules/
 dist/
 build/
+
+# Application logs & scratch output
+*.log
+outputs/
