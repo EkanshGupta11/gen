@@ -34,7 +34,6 @@ struct SpecialistTaskResult {
 struct SpecialistContext {
     question: String,
     plan: InvestigationPlan,
-    prior_tools: Vec<ToolExecution>,
     provider: Arc<dyn ModelProvider>,
     python: OsString,
     worker_script: PathBuf,
@@ -98,22 +97,14 @@ impl Orchestrator {
             record.updated_at = timestamp();
             self.store.save(&record).await.map_err(|e| e.to_string())?;
 
-            // Deduplicate subproblems by specialist role to preserve bounded execution
-            let mut seen = std::collections::HashSet::new();
-            let mut unique_subproblems = Vec::new();
-            for sub in &plan.subproblems {
-                if seen.insert(sub.specialist.as_str()) {
-                    unique_subproblems.push(sub.clone());
-                }
-            }
-
-            let total_count = unique_subproblems.len();
+            // Task identity is defined by task IDs, not specialist names.
+            let subproblems = plan.subproblems.clone();
+            let total_count = subproblems.len();
             let effective_concurrency = self.max_concurrency.clamp(1, 5);
 
             let ctx = Arc::new(SpecialistContext {
                 question: question.clone(),
                 plan: plan.clone(),
-                prior_tools: record.tools.clone(),
                 provider: self.provider.clone(),
                 python: self.python.clone(),
                 worker_script: self.worker_script.clone(),
@@ -121,80 +112,143 @@ impl Orchestrator {
                 budget: budget.clone(),
             });
 
-            if effective_concurrency <= 1 {
-                // Serial execution mode
-                for sub in unique_subproblems {
-                    let task_res = run_specialist_subproblem(sub, ctx.clone()).await;
+            // Bounded execution with dynamic dependency resolution, context propagation,
+            // and failure isolation across both concurrent and serial modes.
+            let mut pending = subproblems;
+            let mut completed_ids = std::collections::HashSet::<String>::new();
+            let mut failed_ids = std::collections::HashSet::<String>::new();
+            let mut task_tools = std::collections::HashMap::<String, Vec<ToolExecution>>::new();
+            let mut task_reports = std::collections::HashMap::<String, AgentReport>::new();
+            let mut join_set: tokio::task::JoinSet<SpecialistTaskResult> =
+                tokio::task::JoinSet::new();
 
-                    record.specialist_reports.push(task_res.report);
-                    record.tools.extend(task_res.tools);
-                    record.verification.extend(task_res.verifications);
-                    record.updated_at = timestamp();
-                    let _ = self.store.save(&record).await;
+            while completed_ids.len() < total_count {
+                // 1. Surface failed dependencies: any pending task depending on a failed task fails immediately
+                let mut newly_failed = Vec::new();
+                let mut i = 0;
+                while i < pending.len() {
+                    let failed_dep = pending[i]
+                        .depends_on
+                        .iter()
+                        .find(|dep| failed_ids.contains(*dep))
+                        .cloned();
+                    if let Some(dep_name) = failed_dep {
+                        let failed_sub = pending.remove(i);
+                        newly_failed.push((failed_sub, dep_name));
+                    } else {
+                        i += 1;
+                    }
                 }
-            } else {
-                // Bounded asynchronous execution with dynamic dependency resolution
-                let mut pending = unique_subproblems;
-                let mut completed_ids = std::collections::HashSet::new();
-                let mut join_set: tokio::task::JoinSet<SpecialistTaskResult> =
-                    tokio::task::JoinSet::new();
 
-                while completed_ids.len() < total_count {
-                    // Spawn all ready subproblems up to max_concurrency
-                    let mut i = 0;
-                    while i < pending.len() && join_set.len() < effective_concurrency {
-                        let is_ready = pending[i]
-                            .depends_on
-                            .iter()
-                            .all(|dep| completed_ids.contains(dep));
+                for (failed_sub, dep_name) in newly_failed {
+                    failed_ids.insert(failed_sub.id.clone());
+                    completed_ids.insert(failed_sub.id.clone());
+                    record.specialist_reports.push(AgentReport {
+                        specialist: failed_sub.specialist,
+                        status: AgentExecutionStatus::Failed,
+                        analysis: format!(
+                            "Dependency '{}' failed, preventing execution.",
+                            dep_name
+                        ),
+                        claims: vec![],
+                        tool_calls: vec![],
+                        assumptions: vec![],
+                        uncertainties: vec![format!("Dependency failure: {dep_name}")],
+                        evidence_requirements: vec![],
+                        duration_ms: 0,
+                    });
+                }
 
-                        if is_ready {
-                            let sub = pending.remove(i);
-                            let sub_ctx = ctx.clone();
+                if completed_ids.len() >= total_count {
+                    break;
+                }
 
-                            join_set.spawn(async move {
-                                run_specialist_subproblem(sub, sub_ctx).await
-                            });
-                        } else {
-                            i += 1;
-                        }
-                    }
+                // 2. Spawn ready subproblems up to effective_concurrency
+                let mut i = 0;
+                while i < pending.len() && join_set.len() < effective_concurrency {
+                    let is_ready = pending[i]
+                        .depends_on
+                        .iter()
+                        .all(|dep| completed_ids.contains(dep));
 
-                    if join_set.is_empty() {
-                        // If no tasks are currently executing and nothing in pending is ready,
-                        // handle unsatisfied dependencies with failure isolation
-                        for rem in pending.drain(..) {
-                            completed_ids.insert(rem.id.clone());
-                            record.specialist_reports.push(AgentReport {
-                                specialist: rem.specialist,
-                                status: AgentExecutionStatus::Failed,
-                                analysis: "Unsatisfied subproblem dependency prevented execution."
-                                    .into(),
-                                claims: vec![],
-                                tool_calls: vec![],
-                                assumptions: vec![],
-                                uncertainties: vec!["Dependency resolution failure".into()],
-                                evidence_requirements: vec![],
-                                duration_ms: 0,
-                            });
-                        }
-                        break;
-                    }
+                    if is_ready {
+                        let sub = pending.remove(i);
+                        let sub_ctx = ctx.clone();
 
-                    // Await the next completing specialist task
-                    if let Some(join_res) = join_set.join_next().await {
-                        match join_res {
-                            Ok(task_res) => {
-                                completed_ids.insert(task_res.subproblem_id);
-                                record.specialist_reports.push(task_res.report);
-                                record.tools.extend(task_res.tools);
-                                record.verification.extend(task_res.verifications);
-                                record.updated_at = timestamp();
-                                let _ = self.store.save(&record).await;
+                        // Collect dependency tools (direct and transitive) and dependency reports
+                        let mut dep_tools = Vec::new();
+                        let mut dep_reports = Vec::new();
+                        let mut dep_set = std::collections::HashSet::new();
+                        let mut queue = sub.depends_on.clone();
+                        while let Some(dep_id) = queue.pop() {
+                            if dep_set.insert(dep_id.clone())
+                                && let Some(parent_sub) =
+                                    plan.subproblems.iter().find(|s| s.id == dep_id)
+                            {
+                                queue.extend(parent_sub.depends_on.clone());
                             }
-                            Err(join_err) => {
-                                tracing::error!(%join_err, "Specialist task panicked or was cancelled");
+                        }
+                        for p_sub in &plan.subproblems {
+                            if dep_set.contains(&p_sub.id) {
+                                if let Some(tools) = task_tools.get(&p_sub.id) {
+                                    dep_tools.extend(tools.clone());
+                                }
+                                if let Some(rep) = task_reports.get(&p_sub.id) {
+                                    dep_reports.push(rep.clone());
+                                }
                             }
+                        }
+
+                        join_set.spawn(async move {
+                            run_specialist_subproblem(sub, sub_ctx, dep_tools, dep_reports).await
+                        });
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                if join_set.is_empty() {
+                    // If no tasks are currently executing and nothing in pending is ready,
+                    // handle unsatisfied dependencies with failure isolation
+                    for rem in pending.drain(..) {
+                        completed_ids.insert(rem.id.clone());
+                        failed_ids.insert(rem.id.clone());
+                        record.specialist_reports.push(AgentReport {
+                            specialist: rem.specialist,
+                            status: AgentExecutionStatus::Failed,
+                            analysis: "Unsatisfied subproblem dependency prevented execution."
+                                .into(),
+                            claims: vec![],
+                            tool_calls: vec![],
+                            assumptions: vec![],
+                            uncertainties: vec!["Dependency resolution failure".into()],
+                            evidence_requirements: vec![],
+                            duration_ms: 0,
+                        });
+                    }
+                    break;
+                }
+
+                // 3. Await the next completing specialist task
+                if let Some(join_res) = join_set.join_next().await {
+                    match join_res {
+                        Ok(task_res) => {
+                            if task_res.report.status == AgentExecutionStatus::Failed {
+                                failed_ids.insert(task_res.subproblem_id.clone());
+                            }
+                            completed_ids.insert(task_res.subproblem_id.clone());
+                            task_tools
+                                .insert(task_res.subproblem_id.clone(), task_res.tools.clone());
+                            task_reports
+                                .insert(task_res.subproblem_id.clone(), task_res.report.clone());
+                            record.specialist_reports.push(task_res.report);
+                            record.tools.extend(task_res.tools);
+                            record.verification.extend(task_res.verifications);
+                            record.updated_at = timestamp();
+                            let _ = self.store.save(&record).await;
+                        }
+                        Err(join_err) => {
+                            tracing::error!(%join_err, "Specialist task panicked or was cancelled");
                         }
                     }
                 }
@@ -285,6 +339,8 @@ impl Orchestrator {
 async fn run_specialist_subproblem(
     sub: ResearchSubproblem,
     ctx: Arc<SpecialistContext>,
+    prior_tools: Vec<ToolExecution>,
+    prior_reports: Vec<AgentReport>,
 ) -> SpecialistTaskResult {
     let start = Instant::now();
 
@@ -302,7 +358,8 @@ async fn run_specialist_subproblem(
                 "question": ctx.question,
                 "task": sub.task,
                 "plan": ctx.plan,
-                "tool_results": ctx.prior_tools
+                "tool_results": prior_tools,
+                "dependency_reports": prior_reports,
             }),
         },
         ctx.budget.as_ref(),
@@ -793,5 +850,424 @@ mod tests {
         // Arithmetic tool was verified
         assert_eq!(record.tools.len(), 1);
         assert_eq!(record.tools[0].epistemic_status, EpistemicStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn regression_specialist_deduplication_preserves_distinct_subproblems_same_role() {
+        struct DuplicateRoleProvider;
+
+        #[async_trait::async_trait]
+        impl ModelProvider for DuplicateRoleProvider {
+            async fn complete(
+                &self,
+                req: GenerationRequest,
+                _budget: &RequestBudget,
+            ) -> Result<provider::ModelCompletion, provider::ModelError> {
+                match req.stage {
+                    GenerationStage::Planning => {
+                        let plan = json!({
+                            "objective": "Test duplicate role preservation",
+                            "entities": [],
+                            "known_variables": [],
+                            "unknown_variables": [],
+                            "constraints": [],
+                            "expected_output": "Two math results",
+                            "subproblems": [
+                                {
+                                    "id": "math-1",
+                                    "specialist": Specialist::Mathematics,
+                                    "task": "Compute addition: 15 + 25",
+                                    "depends_on": [],
+                                    "required_tools": ["arithmetic"]
+                                },
+                                {
+                                    "id": "math-2",
+                                    "specialist": Specialist::Mathematics,
+                                    "task": "Compute multiplication: 6 * 7",
+                                    "depends_on": [],
+                                    "required_tools": ["arithmetic"]
+                                }
+                            ],
+                            "assumptions": [],
+                            "uncertainties": []
+                        });
+                        Ok(provider::ModelCompletion {
+                            content: serde_json::to_string(&plan).unwrap(),
+                            usage: None,
+                        })
+                    }
+                    GenerationStage::Specialist => {
+                        let task_str = req.input.get("task").and_then(Value::as_str).unwrap_or("");
+                        let tool_call = if task_str.contains("addition") {
+                            json!({
+                                "tool": "arithmetic",
+                                "arguments": {"a": 15, "b": 25, "op": "add"},
+                                "rationale": "Add 15 and 25"
+                            })
+                        } else {
+                            json!({
+                                "tool": "arithmetic",
+                                "arguments": {"a": 6, "b": 7, "op": "multiply"},
+                                "rationale": "Multiply 6 and 7"
+                            })
+                        };
+                        let out = json!({
+                            "analysis": format!("Executed task: {task_str}"),
+                            "claims": [],
+                            "tool_calls": [tool_call],
+                            "assumptions": [],
+                            "uncertainties": [],
+                            "evidence_requirements": []
+                        });
+                        Ok(provider::ModelCompletion {
+                            content: serde_json::to_string(&out).unwrap(),
+                            usage: None,
+                        })
+                    }
+                    GenerationStage::Synthesis => {
+                        let syn = json!({
+                            "executive_summary": "Both mathematics tasks completed.",
+                            "key_findings": [],
+                            "disagreements": [],
+                            "assumptions": [],
+                            "uncertainties": [],
+                            "next_steps": []
+                        });
+                        Ok(provider::ModelCompletion {
+                            content: serde_json::to_string(&syn).unwrap(),
+                            usage: None,
+                        })
+                    }
+                }
+            }
+
+            fn settings(&self) -> ProviderSettings {
+                ProviderSettings {
+                    model_provider: "test_dedup".into(),
+                    model_name: Some("test-dedup".into()),
+                    memory_provider: "sqlite",
+                    credentials_configured: true,
+                    max_tokens_per_request: 1000,
+                }
+            }
+
+            fn is_mock(&self) -> bool {
+                false
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _) = Store::initialize(directory.path().join("dedup_test.sqlite3")).unwrap();
+        let orchestration = Orchestrator {
+            store,
+            provider: Arc::new(DuplicateRoleProvider),
+            python: get_python_exe().into(),
+            worker_script: PathBuf::from("engine/app.py"),
+            worker_timeout: Duration::from_secs(5),
+            max_concurrency: 2,
+        };
+
+        let record = orchestration
+            .investigate("Two distinct mathematics subproblems".into())
+            .await
+            .unwrap();
+
+        assert_eq!(record.status, InvestigationStatus::Completed);
+        // DEFECT A REGRESSION CHECK: Both subproblems must be preserved and executed!
+        assert_eq!(
+            record.specialist_reports.len(),
+            2,
+            "Both subproblems must execute even if they share the same specialist role"
+        );
+        assert_eq!(record.tools.len(), 2);
+        let results: Vec<f64> = record
+            .tools
+            .iter()
+            .map(|t| t.output.as_ref().unwrap()["value"].as_f64().unwrap())
+            .collect();
+        assert!(results.contains(&40.0));
+        assert!(results.contains(&42.0));
+    }
+
+    #[tokio::test]
+    async fn regression_dependency_context_propagation_to_downstream_tasks() {
+        struct DependencyPropagationProvider;
+
+        #[async_trait::async_trait]
+        impl ModelProvider for DependencyPropagationProvider {
+            async fn complete(
+                &self,
+                req: GenerationRequest,
+                _budget: &RequestBudget,
+            ) -> Result<provider::ModelCompletion, provider::ModelError> {
+                match req.stage {
+                    GenerationStage::Planning => {
+                        let plan = json!({
+                            "objective": "Test dependency propagation",
+                            "entities": [],
+                            "known_variables": [],
+                            "unknown_variables": [],
+                            "constraints": [],
+                            "expected_output": "Chained calculation",
+                            "subproblems": [
+                                {
+                                    "id": "step-1",
+                                    "specialist": Specialist::Mathematics,
+                                    "task": "Base calculation",
+                                    "depends_on": [],
+                                    "required_tools": ["arithmetic"]
+                                },
+                                {
+                                    "id": "step-2",
+                                    "specialist": Specialist::Mathematics,
+                                    "task": "Downstream calculation requiring step-1 results",
+                                    "depends_on": ["step-1"],
+                                    "required_tools": ["arithmetic"]
+                                }
+                            ],
+                            "assumptions": [],
+                            "uncertainties": []
+                        });
+                        Ok(provider::ModelCompletion {
+                            content: serde_json::to_string(&plan).unwrap(),
+                            usage: None,
+                        })
+                    }
+                    GenerationStage::Specialist => {
+                        let task_str = req.input.get("task").and_then(Value::as_str).unwrap_or("");
+                        let tool_results = req.input.get("tool_results").and_then(Value::as_array);
+
+                        if task_str.contains("Downstream") {
+                            // DEFECT B REGRESSION CHECK:
+                            // Verify that step-1 tool output was successfully propagated to step-2!
+                            assert!(
+                                tool_results.is_some() && !tool_results.unwrap().is_empty(),
+                                "Downstream task step-2 must receive prior tool results from step-1!"
+                            );
+                            let prior_result = tool_results.unwrap()[0]
+                                .get("output")
+                                .and_then(|o| o.get("value"))
+                                .and_then(Value::as_f64)
+                                .unwrap();
+                            assert_eq!(prior_result, 30.0);
+
+                            let tool_call = json!({
+                                "tool": "arithmetic",
+                                "arguments": {"a": prior_result, "b": 2.0, "op": "multiply"},
+                                "rationale": "Double the step-1 result"
+                            });
+                            let out = json!({
+                                "analysis": "Step 2 executed with step 1 context",
+                                "claims": [],
+                                "tool_calls": [tool_call],
+                                "assumptions": [],
+                                "uncertainties": [],
+                                "evidence_requirements": []
+                            });
+                            Ok(provider::ModelCompletion {
+                                content: serde_json::to_string(&out).unwrap(),
+                                usage: None,
+                            })
+                        } else {
+                            let tool_call = json!({
+                                "tool": "arithmetic",
+                                "arguments": {"a": 10.0, "b": 20.0, "op": "add"},
+                                "rationale": "Initial sum"
+                            });
+                            let out = json!({
+                                "analysis": "Step 1 executed",
+                                "claims": [],
+                                "tool_calls": [tool_call],
+                                "assumptions": [],
+                                "uncertainties": [],
+                                "evidence_requirements": []
+                            });
+                            Ok(provider::ModelCompletion {
+                                content: serde_json::to_string(&out).unwrap(),
+                                usage: None,
+                            })
+                        }
+                    }
+                    GenerationStage::Synthesis => {
+                        let syn = json!({
+                            "executive_summary": "Dependency chain completed successfully.",
+                            "key_findings": [],
+                            "disagreements": [],
+                            "assumptions": [],
+                            "uncertainties": [],
+                            "next_steps": []
+                        });
+                        Ok(provider::ModelCompletion {
+                            content: serde_json::to_string(&syn).unwrap(),
+                            usage: None,
+                        })
+                    }
+                }
+            }
+
+            fn settings(&self) -> ProviderSettings {
+                ProviderSettings {
+                    model_provider: "test_dep_prop".into(),
+                    model_name: Some("test-dep-prop".into()),
+                    memory_provider: "sqlite",
+                    credentials_configured: true,
+                    max_tokens_per_request: 1000,
+                }
+            }
+
+            fn is_mock(&self) -> bool {
+                false
+            }
+        }
+
+        // Test with max_concurrency: 2
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _) = Store::initialize(directory.path().join("prop_test.sqlite3")).unwrap();
+        let orchestration = Orchestrator {
+            store,
+            provider: Arc::new(DependencyPropagationProvider),
+            python: get_python_exe().into(),
+            worker_script: PathBuf::from("engine/app.py"),
+            worker_timeout: Duration::from_secs(5),
+            max_concurrency: 2,
+        };
+
+        let record = orchestration
+            .investigate("Chained calculations with dependency context".into())
+            .await
+            .unwrap();
+
+        assert_eq!(record.status, InvestigationStatus::Completed);
+        assert_eq!(record.tools.len(), 2);
+        assert_eq!(
+            record.tools[1].output.as_ref().unwrap()["value"]
+                .as_f64()
+                .unwrap(),
+            60.0
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_failed_dependency_is_surfaced_to_downstream_tasks() {
+        struct FailingDependencyProvider;
+
+        #[async_trait::async_trait]
+        impl ModelProvider for FailingDependencyProvider {
+            async fn complete(
+                &self,
+                req: GenerationRequest,
+                _budget: &RequestBudget,
+            ) -> Result<provider::ModelCompletion, provider::ModelError> {
+                match req.stage {
+                    GenerationStage::Planning => {
+                        let plan = json!({
+                            "objective": "Test failed dependency propagation",
+                            "entities": [],
+                            "known_variables": [],
+                            "unknown_variables": [],
+                            "constraints": [],
+                            "expected_output": "Fail downstream",
+                            "subproblems": [
+                                {
+                                    "id": "step-fail",
+                                    "specialist": Specialist::Physics,
+                                    "task": "Fails at model level",
+                                    "depends_on": [],
+                                    "required_tools": []
+                                },
+                                {
+                                    "id": "step-dependent",
+                                    "specialist": Specialist::Mathematics,
+                                    "task": "Should not execute because step-fail failed",
+                                    "depends_on": ["step-fail"],
+                                    "required_tools": ["arithmetic"]
+                                }
+                            ],
+                            "assumptions": [],
+                            "uncertainties": []
+                        });
+                        Ok(provider::ModelCompletion {
+                            content: serde_json::to_string(&plan).unwrap(),
+                            usage: None,
+                        })
+                    }
+                    GenerationStage::Specialist if req.specialist == Some(Specialist::Physics) => {
+                        Err(provider::ModelError::Http {
+                            status: 500,
+                            message: "Physics step exploded".into(),
+                        })
+                    }
+                    GenerationStage::Specialist => {
+                        panic!("step-dependent should never be called when dependency fails!");
+                    }
+                    GenerationStage::Synthesis => {
+                        let syn = json!({
+                            "executive_summary": "Surfaced dependency failure cleanly.",
+                            "key_findings": [],
+                            "disagreements": [],
+                            "assumptions": [],
+                            "uncertainties": ["Step fail exploded"],
+                            "next_steps": []
+                        });
+                        Ok(provider::ModelCompletion {
+                            content: serde_json::to_string(&syn).unwrap(),
+                            usage: None,
+                        })
+                    }
+                }
+            }
+
+            fn settings(&self) -> ProviderSettings {
+                ProviderSettings {
+                    model_provider: "test_fail_dep".into(),
+                    model_name: Some("test-fail-dep".into()),
+                    memory_provider: "sqlite",
+                    credentials_configured: true,
+                    max_tokens_per_request: 1000,
+                }
+            }
+
+            fn is_mock(&self) -> bool {
+                false
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _) = Store::initialize(directory.path().join("fail_dep.sqlite3")).unwrap();
+        let orchestration = Orchestrator {
+            store,
+            provider: Arc::new(FailingDependencyProvider),
+            python: get_python_exe().into(),
+            worker_script: PathBuf::from("engine/app.py"),
+            worker_timeout: Duration::from_secs(5),
+            max_concurrency: 1, // Serial mode to test dependency failure handling in serial mode too
+        };
+
+        let record = orchestration
+            .investigate("Verify failed dependency handling".into())
+            .await
+            .unwrap();
+
+        assert_eq!(record.status, InvestigationStatus::Completed);
+        assert_eq!(record.specialist_reports.len(), 2);
+
+        let parent_report = record
+            .specialist_reports
+            .iter()
+            .find(|r| r.specialist == Specialist::Physics)
+            .unwrap();
+        assert_eq!(parent_report.status, AgentExecutionStatus::Failed);
+
+        let dep_report = record
+            .specialist_reports
+            .iter()
+            .find(|r| r.specialist == Specialist::Mathematics)
+            .unwrap();
+        assert_eq!(dep_report.status, AgentExecutionStatus::Failed);
+        assert!(
+            dep_report
+                .analysis
+                .contains("Dependency 'step-fail' failed")
+        );
     }
 }
