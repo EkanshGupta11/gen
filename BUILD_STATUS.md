@@ -1,10 +1,14 @@
 # Build Status — Milestone 1.2.1: Scientific Reliability and Intelligence Validation
 
-## Repository & Environment Audit
+## Canonical Repository & Collaboration Environment
 
-- **Branch:** `m1.2-reliability` created from clean state on `env-validation`.
-- **Database Integrity:** Real user database (`data/neurogenesis.sqlite3`) and pre-migration backups remain completely intact and unmodified. All automated tests run against isolated temporary SQLite databases.
-- **Python Environment:** Standard CPython 3.13 virtual environment (`.venv-cpython313`) managed by Astral `uv` with pre-installed scientific dependencies: `numpy 2.5.4`, `scipy 1.18.1`, `sympy 1.14.0`, `pandas 3.1.1`, `matplotlib 3.11.2`.
+- **Canonical Development Workspace:** `C:\Users\Ekansh\Documents\Codex\NeuroGenesis`
+- **Remote Git Repository:** `https://github.com/EkanshGupta11/gen.git`
+- **Remote Branch:** `main` (clean milestone history terminating at `c5a0e45` + clean repository boundaries commit `88c8c81`)
+- **Shared Collaboration:** Configured for cross-agent development between ChatGPT, Antigravity, and human engineers. The repository contains strictly version-controlled source code (< 1 MB total clone size) with zero build artifacts, caches, or secrets.
+- **Archive Workspace:** The original workspace (`C:\Users\Ekansh\Documents\Codex\2026-11-14\you-are-the-principal-software-architect`) remains completely intact as a local offline reference and archive.
+- **Database Integrity:** Local SQLite databases (`data/neurogenesis.sqlite3` and migration backups) and runtime settings (`.env`) are active and preserved in the canonical clone, strictly excluded from Git via `.gitignore`.
+- **Python Environment:** Standard CPython 3.13.15 virtual environment (`.venv-cpython313`) managed by Astral `uv` with pre-installed scientific dependencies: `numpy 2.5.5`, `scipy 1.18.1`, `sympy 1.14.0`, `pandas 3.1.1`, `matplotlib 3.11.2`.
 - **Hosted Model Credentials:** Safely inspected `.env` without printing secrets. `MODEL_API_KEY` is empty; live hosted inference remains honestly marked as untested. Offline mock mode (`MODEL_PROVIDER=mock`) is active for deterministic testing.
 
 ---
@@ -47,9 +51,9 @@
 
 ---
 
-## Test Execution Results
+## Test Execution Results (Canonical Clone)
 
-All checks and tests were executed in the native Windows development environment:
+All checks and tests executed cleanly in `C:\Users\Ekansh\Documents\Codex\NeuroGenesis`:
 
 | Test Suite / Check | Command | Result | Details |
 | :--- | :--- | :--- | :--- |
@@ -57,7 +61,7 @@ All checks and tests were executed in the native Windows development environment
 | **Rust Compilation** | `cargo check` | **PASSED** | 0 errors |
 | **Clippy Linter** | `cargo clippy --locked --all-targets -- -D warnings` | **PASSED** | 0 warnings, 0 errors |
 | **Rust Test Suite** | `cargo test --locked` | **PASSED** | **26 passed, 0 failed, 0 ignored** |
-| **Python Test Suite** | `.venv-cpython313\Scripts\python.exe -m unittest discover -s engine -p "test_*.py" -v` | **PASSED** | **11 passed, 0 failed** (0.41s) |
+| **Python Test Suite** | `.venv-cpython313\Scripts\python.exe -m unittest discover -s engine -p "test_*.py" -v` | **PASSED** | **11 passed, 0 failed** (0.62s) |
 | **Frontend Syntax** | `node --check` | **PASSED** | Valid inline JavaScript syntax |
 | **Persistence Recovery** | `python scripts/test_persistence_recovery.py` | **PASSED** | Verified SQLite persistence across process restarts, tool outputs, and verification records |
 | **Browser E2E Verification** | `node scripts/test_browser_e2e.js` | **PASSED** | Headless Chrome verified UI loading, investigation execution, DOM rendering, and `.pill.pill-verified` badges |
