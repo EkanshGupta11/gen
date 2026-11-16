@@ -1,18 +1,14 @@
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     contracts::*,
     provider::{self, GenerationRequest, GenerationStage, ModelProvider, RequestBudget},
     store::Store,
-    verification, worker,
 };
 
 pub struct Orchestrator {
@@ -22,23 +18,6 @@ pub struct Orchestrator {
     pub worker_script: PathBuf,
     pub worker_timeout: Duration,
     pub max_concurrency: usize,
-}
-
-struct SpecialistTaskResult {
-    subproblem_id: String,
-    report: AgentReport,
-    tools: Vec<ToolExecution>,
-    verifications: Vec<VerificationResult>,
-}
-
-struct SpecialistContext {
-    question: String,
-    plan: InvestigationPlan,
-    provider: Arc<dyn ModelProvider>,
-    python: OsString,
-    worker_script: PathBuf,
-    worker_timeout: Duration,
-    budget: Arc<RequestBudget>,
 }
 
 impl Orchestrator {
@@ -104,91 +83,151 @@ impl Orchestrator {
             record.status = InvestigationStatus::Executing;
             record.updated_at = timestamp();
 
-            if let Some(cs) = record.cognitive_state.as_mut() {
-                cs.context.primary_objective = plan.objective.clone();
-                cs.context.relevant_entities = plan.entities.clone();
-                cs.context.known_variables = plan.known_variables.clone();
-                cs.context.unknown_variables = plan.unknown_variables.clone();
-                cs.context.constraints = plan.constraints.clone();
-                cs.context.current_stage = "executing_subproblems".into();
-                for sub in &plan.subproblems {
-                    let goal = crate::cognition::Goal {
-                        id: sub.id.clone(),
-                        description: sub.task.clone(),
-                        parent_goal: None,
-                        priority: 50,
-                        status: if sub.depends_on.is_empty() {
-                            crate::cognition::GoalStatus::Active
-                        } else {
-                            crate::cognition::GoalStatus::Pending
-                        },
-                        dependencies: sub.depends_on.clone(),
-                        preconditions: Vec::new(),
-                        completion_criteria: vec![
-                            crate::cognition::CompletionCriterion::SubGoalsCompleted,
-                        ],
-                        created_at: timestamp(),
-                        completed_at: None,
-                    };
-                    let _ = cs.goals.add_goal(goal);
+            let mut cs = crate::cognition::CognitiveState::new(
+                record.id.clone(),
+                record.question.clone(),
+                crate::cognition::DEFAULT_WORKING_MEMORY_CAPACITY,
+                50,
+            );
+            cs.context.relevant_entities = plan.entities.clone();
+            cs.context.known_variables = plan.known_variables.clone();
+            cs.context.unknown_variables = plan.unknown_variables.clone();
+            cs.context.constraints = plan.constraints.clone();
+            cs.context.current_stage = "executing_subproblems".into();
+
+            for sub in &plan.subproblems {
+                let mut criteria = vec![
+                    crate::cognition::CompletionCriterion::SpecialistReportReceived {
+                        specialist: sub.specialist.as_str().to_string(),
+                    },
+                ];
+                for tool in &sub.required_tools {
+                    criteria.push(crate::cognition::CompletionCriterion::ToolExecuted {
+                        tool_name: tool.clone(),
+                    });
+                    criteria.push(crate::cognition::CompletionCriterion::CalculationVerified {
+                        subject_id: tool.clone(),
+                    });
                 }
+
+                let goal = crate::cognition::Goal {
+                    id: sub.id.clone(),
+                    description: sub.task.clone(),
+                    parent_goal: None,
+                    priority: 50,
+                    status: if sub.depends_on.is_empty() {
+                        crate::cognition::GoalStatus::Active
+                    } else {
+                        crate::cognition::GoalStatus::Pending
+                    },
+                    dependencies: sub.depends_on.clone(),
+                    preconditions: Vec::new(),
+                    completion_criteria: criteria,
+                    created_at: timestamp(),
+                    completed_at: None,
+                };
+                cs.goals.add_goal(goal)?;
+
+                cs.goals.add_agenda_item(crate::cognition::AgendaItem {
+                    id: format!("agenda-{}", sub.id),
+                    goal_id: sub.id.clone(),
+                    action: crate::cognition::ExecutiveAction::RequestSpecialistAnalysis {
+                        specialist: sub.specialist.clone(),
+                        task: sub.task.clone(),
+                        goal_id: sub.id.clone(),
+                    },
+                    status: if sub.depends_on.is_empty() {
+                        crate::cognition::AgendaStatus::Ready
+                    } else {
+                        crate::cognition::AgendaStatus::Blocked
+                    },
+                    created_at: timestamp(),
+                });
             }
 
-            self.store.save(&record).await.map_err(|e| e.to_string())?;
+            // Synthesis goal
+            let all_sub_ids: Vec<String> =
+                plan.subproblems.iter().map(|s| s.id.clone()).collect();
+            let synth_goal = crate::cognition::Goal {
+                id: "synthesis-goal".into(),
+                description: "Synthesize findings and establish validated research conclusion".into(),
+                parent_goal: None,
+                priority: 20,
+                status: crate::cognition::GoalStatus::Pending,
+                dependencies: all_sub_ids.clone(),
+                preconditions: Vec::new(),
+                completion_criteria: vec![crate::cognition::CompletionCriterion::SynthesisCompleted],
+                created_at: timestamp(),
+                completed_at: None,
+            };
+            cs.goals.add_goal(synth_goal)?;
 
-            // Task identity is defined by task IDs, not specialist names.
-            let subproblems = plan.subproblems.clone();
-            let total_count = subproblems.len();
-            let effective_concurrency = self.max_concurrency.clamp(1, 5);
-
-            let ctx = Arc::new(SpecialistContext {
-                question: question.clone(),
-                plan: plan.clone(),
-                provider: self.provider.clone(),
-                python: self.python.clone(),
-                worker_script: self.worker_script.clone(),
-                worker_timeout: self.worker_timeout,
-                budget: budget.clone(),
+            cs.goals.add_agenda_item(crate::cognition::AgendaItem {
+                id: "agenda-synthesis".into(),
+                goal_id: "synthesis-goal".into(),
+                action: crate::cognition::ExecutiveAction::SynthesizeFindings {
+                    goal_ids: all_sub_ids,
+                },
+                status: crate::cognition::AgendaStatus::Blocked,
+                created_at: timestamp(),
             });
 
-            // Bounded execution with dynamic dependency resolution, context propagation,
-            // and failure isolation across both concurrent and serial modes.
-            let mut pending = subproblems;
-            let mut completed_ids = std::collections::HashSet::<String>::new();
-            let mut failed_ids = std::collections::HashSet::<String>::new();
-            let mut task_tools = std::collections::HashMap::<String, Vec<ToolExecution>>::new();
-            let mut task_reports = std::collections::HashMap::<String, AgentReport>::new();
-            let mut join_set: tokio::task::JoinSet<SpecialistTaskResult> =
-                tokio::task::JoinSet::new();
+            record.cognitive_state = Some(cs.clone());
+            self.store.save(&record).await.map_err(|e| e.to_string())?;
 
-            while completed_ids.len() < total_count {
-                // 1. Surface failed dependencies: any pending task depending on a failed task fails immediately
-                let mut newly_failed = Vec::new();
-                let mut i = 0;
-                while i < pending.len() {
-                    let failed_dep = pending[i]
-                        .depends_on
-                        .iter()
-                        .find(|dep| failed_ids.contains(*dep))
-                        .cloned();
-                    if let Some(dep_name) = failed_dep {
-                        let failed_sub = pending.remove(i);
-                        newly_failed.push((failed_sub, dep_name));
-                    } else {
-                        i += 1;
-                    }
+            let executor = crate::cognition::AsyncActionExecutor::new(
+                self.python.clone(),
+                self.worker_script.clone(),
+                self.worker_timeout,
+                self.provider.clone(),
+                budget.clone(),
+            );
+
+            let config = crate::cognition::ExecutiveConfig {
+                max_cycles: 50,
+                max_actions: 100,
+                timeout: Duration::from_secs(45),
+                working_memory_capacity: crate::cognition::DEFAULT_WORKING_MEMORY_CAPACITY,
+            };
+
+            let _ = self.max_concurrency;
+            let mut runtime = crate::cognition::CognitiveRuntime::from_existing_state(
+                cs,
+                config,
+                executor,
+                self.store.clone(),
+            );
+
+            let _ = runtime.run().await;
+            let final_state = runtime.state().clone();
+
+            // Reconstruct specialist reports in subproblem order
+            for sub in &plan.subproblems {
+                if let Some(item) = final_state.knowledge_items.values().find(|k| {
+                    k.provenance.source_type == "specialist_report"
+                        && k.related_goals.contains(&sub.id)
+                }) && let Ok(rep) = serde_json::from_value::<AgentReport>(item.content.clone()) {
+                    record.specialist_reports.push(rep);
+                    continue;
                 }
 
-                for (failed_sub, dep_name) in newly_failed {
-                    failed_ids.insert(failed_sub.id.clone());
-                    completed_ids.insert(failed_sub.id.clone());
+                // Check if a dependency failed
+                let failed_dep = sub.depends_on.iter().find(|dep_id| {
+                    final_state
+                        .goals
+                        .get_goal(dep_id)
+                        .map(|g| {
+                            g.status == crate::cognition::GoalStatus::Failed
+                                || g.status == crate::cognition::GoalStatus::Cancelled
+                        })
+                        .unwrap_or(false)
+                });
+
+                if let Some(dep_name) = failed_dep {
                     record.specialist_reports.push(AgentReport {
-                        specialist: failed_sub.specialist,
+                        specialist: sub.specialist.clone(),
                         status: AgentExecutionStatus::Failed,
-                        analysis: format!(
-                            "Dependency '{}' failed, preventing execution.",
-                            dep_name
-                        ),
+                        analysis: format!("Dependency '{}' failed, preventing execution.", dep_name),
                         claims: vec![],
                         tool_calls: vec![],
                         assumptions: vec![],
@@ -196,198 +235,94 @@ impl Orchestrator {
                         evidence_requirements: vec![],
                         duration_ms: 0,
                     });
+                } else if let Some(goal) = final_state.goals.get_goal(&sub.id)
+                    && (goal.status == crate::cognition::GoalStatus::Blocked
+                        || goal.status == crate::cognition::GoalStatus::Failed)
+                {
+                    record.specialist_reports.push(AgentReport {
+                        specialist: sub.specialist.clone(),
+                        status: AgentExecutionStatus::Failed,
+                        analysis: "Unsatisfied subproblem dependency prevented execution.".into(),
+                        claims: vec![],
+                        tool_calls: vec![],
+                        assumptions: vec![],
+                        uncertainties: vec!["Dependency resolution failure".into()],
+                        evidence_requirements: vec![],
+                        duration_ms: 0,
+                    });
                 }
+            }
 
-                if completed_ids.len() >= total_count {
-                    break;
-                }
-
-                // 2. Spawn ready subproblems up to effective_concurrency
-                let mut i = 0;
-                while i < pending.len() && join_set.len() < effective_concurrency {
-                    let is_ready = pending[i]
-                        .depends_on
-                        .iter()
-                        .all(|dep| completed_ids.contains(dep));
-
-                    if is_ready {
-                        let sub = pending.remove(i);
-                        let sub_ctx = ctx.clone();
-
-                        // Collect dependency tools (direct and transitive) and dependency reports
-                        let mut dep_tools = Vec::new();
-                        let mut dep_reports = Vec::new();
-                        let mut dep_set = std::collections::HashSet::new();
-                        let mut queue = sub.depends_on.clone();
-                        while let Some(dep_id) = queue.pop() {
-                            if dep_set.insert(dep_id.clone())
-                                && let Some(parent_sub) =
-                                    plan.subproblems.iter().find(|s| s.id == dep_id)
-                            {
-                                queue.extend(parent_sub.depends_on.clone());
-                            }
+            // Extract tools and verifications from knowledge items in subproblem plan order
+            for sub in &plan.subproblems {
+                let mut sub_tools: Vec<_> = final_state
+                    .knowledge_items
+                    .values()
+                    .filter(|k| {
+                        k.item_type == crate::cognition::KnowledgeItemType::Calculation
+                            && k.related_goals.contains(&sub.id)
+                    })
+                    .collect();
+                sub_tools.sort_by_key(|k| &k.timestamp);
+                for item in sub_tools {
+                    if let Ok(tool) = serde_json::from_value::<ToolExecution>(item.content.clone()) {
+                        if let Some(v_val) = item.content.get("verification")
+                            && let Ok(v_res) = serde_json::from_value::<VerificationResult>(v_val.clone())
+                            && !record.verification.iter().any(|v| v.id == v_res.id)
+                        {
+                            record.verification.push(v_res);
                         }
-                        for p_sub in &plan.subproblems {
-                            if dep_set.contains(&p_sub.id) {
-                                if let Some(tools) = task_tools.get(&p_sub.id) {
-                                    dep_tools.extend(tools.clone());
-                                }
-                                if let Some(rep) = task_reports.get(&p_sub.id) {
-                                    dep_reports.push(rep.clone());
-                                }
-                            }
-                        }
-
-                        join_set.spawn(async move {
-                            run_specialist_subproblem(sub, sub_ctx, dep_tools, dep_reports).await
-                        });
-                    } else {
-                        i += 1;
-                    }
-                }
-
-                if join_set.is_empty() {
-                    // If no tasks are currently executing and nothing in pending is ready,
-                    // handle unsatisfied dependencies with failure isolation
-                    for rem in pending.drain(..) {
-                        completed_ids.insert(rem.id.clone());
-                        failed_ids.insert(rem.id.clone());
-                        record.specialist_reports.push(AgentReport {
-                            specialist: rem.specialist,
-                            status: AgentExecutionStatus::Failed,
-                            analysis: "Unsatisfied subproblem dependency prevented execution."
-                                .into(),
-                            claims: vec![],
-                            tool_calls: vec![],
-                            assumptions: vec![],
-                            uncertainties: vec!["Dependency resolution failure".into()],
-                            evidence_requirements: vec![],
-                            duration_ms: 0,
-                        });
-                    }
-                    break;
-                }
-
-                // 3. Await the next completing specialist task
-                if let Some(join_res) = join_set.join_next().await {
-                    match join_res {
-                        Ok(task_res) => {
-                            if task_res.report.status == AgentExecutionStatus::Failed {
-                                failed_ids.insert(task_res.subproblem_id.clone());
-                            }
-                            completed_ids.insert(task_res.subproblem_id.clone());
-                            task_tools
-                                .insert(task_res.subproblem_id.clone(), task_res.tools.clone());
-                            task_reports
-                                .insert(task_res.subproblem_id.clone(), task_res.report.clone());
-                            if let Some(cs) = record.cognitive_state.as_mut() {
-                                if let Some(goal) = cs.goals.get_goal_mut(&task_res.subproblem_id)
-                                {
-                                    if task_res.report.status == AgentExecutionStatus::Failed {
-                                        goal.status = crate::cognition::GoalStatus::Failed;
-                                    } else {
-                                        goal.status = crate::cognition::GoalStatus::Completed;
-                                        goal.completed_at = Some(timestamp());
-                                    }
-                                }
-                                for tool in &task_res.tools {
-                                    let k_item = crate::cognition::KnowledgeItem {
-                                        id: tool.id.clone(),
-                                        item_type: crate::cognition::KnowledgeItemType::Calculation,
-                                        content: serde_json::to_value(tool).unwrap_or_default(),
-                                        provenance: crate::cognition::Provenance::new(
-                                            "specialist_tool",
-                                        )
-                                        .with_source_id(tool.specialist.as_str()),
-                                        epistemic_status: tool.epistemic_status.clone(),
-                                        related_goals: vec![task_res.subproblem_id.clone()],
-                                        related_entities: vec![],
-                                        timestamp: timestamp(),
-                                    };
-                                    cs.add_knowledge_item(k_item);
-                                }
-                            }
-                            record.specialist_reports.push(task_res.report);
-                            record.tools.extend(task_res.tools);
-                            record.verification.extend(task_res.verifications);
-                            record.updated_at = timestamp();
-                            let _ = self.store.save(&record).await;
-                        }
-                        Err(join_err) => {
-                            tracing::error!(%join_err, "Specialist task panicked or was cancelled");
+                        if !record.tools.iter().any(|t| t.id == tool.id) {
+                            record.tools.push(tool);
                         }
                     }
                 }
             }
 
-            // Synthesis phase
-            record.status = InvestigationStatus::Synthesizing;
-            record.updated_at = timestamp();
-            self.store.save(&record).await.map_err(|e| e.to_string())?;
-
-            let mut synthesis: Synthesis = provider::generate_structured(
-                self.provider.as_ref(),
-                GenerationRequest {
-                    stage: GenerationStage::Synthesis,
-                    specialist: None,
-                    system_instruction: "Synthesize specialist reports and computed tool outputs. Clearly separate mock output, hypotheses, calculations, evidence, assumptions, disagreements, uncertainty, and next steps. Do not claim evidence from unavailable sources. Return fields executive_summary,key_findings,disagreements,assumptions,uncertainties,next_steps.".into(),
-                    input: json!({
-                        "question": question,
-                        "plan": plan,
-                        "specialist_reports": record.specialist_reports,
-                        "tools": record.tools,
-                        "sources": record.sources,
-                    }),
-                },
-                budget.as_ref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-            // Strict epistemic rules for synthesis findings:
-            // A model can never self-assign 'verified' status.
-            for claim in &mut synthesis.key_findings {
-                let backed = claim.source_ids.iter().any(|id| {
-                    record
-                        .sources
-                        .iter()
-                        .any(|source| source.get("id").and_then(Value::as_str) == Some(id))
-                });
-                let verified = claim.tool_ids.iter().any(|id| {
-                    record.tools.iter().any(|tool| {
-                        &tool.id == id && tool.epistemic_status == EpistemicStatus::Verified
-                    })
-                });
-                let calculated = claim.tool_ids.iter().any(|id| {
-                    record.tools.iter().any(|tool| {
-                        &tool.id == id && tool.epistemic_status == EpistemicStatus::Calculated
-                    })
-                });
-
-                if !backed {
-                    claim.epistemic_status = if verified {
-                        EpistemicStatus::Verified
-                    } else if calculated {
-                        EpistemicStatus::Calculated
-                    } else {
-                        EpistemicStatus::Hypothesis
-                    };
+            // Extract any remaining tools not attached to a specific subproblem
+            let mut remaining_tools: Vec<_> = final_state
+                .knowledge_items
+                .values()
+                .filter(|k| k.item_type == crate::cognition::KnowledgeItemType::Calculation)
+                .collect();
+            remaining_tools.sort_by_key(|k| &k.timestamp);
+            for item in remaining_tools {
+                if let Ok(tool) = serde_json::from_value::<ToolExecution>(item.content.clone()) {
+                    if let Some(v_val) = item.content.get("verification")
+                        && let Ok(v_res) = serde_json::from_value::<VerificationResult>(v_val.clone())
+                        && !record.verification.iter().any(|v| v.id == v_res.id)
+                    {
+                        record.verification.push(v_res);
+                    }
+                    if !record.tools.iter().any(|t| t.id == tool.id) {
+                        record.tools.push(tool);
+                    }
                 }
             }
 
-            record.synthesis = Some(synthesis);
-            record.status = InvestigationStatus::Completed;
-            record.updated_at = timestamp();
+            // Extract synthesis
+            if let Some(item) = final_state.knowledge_items.values().find(|k| {
+                k.provenance.source_type == "synthesis"
+            }) && let Ok(syn) = serde_json::from_value::<Synthesis>(item.content.clone()) {
+                record.synthesis = Some(syn);
+            }
+
+            record.cognitive_state = Some(final_state.clone());
             record.model.request_count = budget.model_call_count();
             record.model.http_attempt_count = budget.http_attempt_count();
             record.model.usage = budget.usage();
+            record.updated_at = timestamp();
 
-            if let Some(cs) = record.cognitive_state.as_mut() {
-                cs.context.current_stage = "completed".into();
-                cs.executive.current_phase = crate::cognition::ExecutivePhase::Stopped;
-                cs.executive.stop_reason = Some(crate::cognition::StopReason::ObjectiveAchieved);
+            if let Some(crate::cognition::StopReason::MetacognitiveAbort { rationale }) =
+                &final_state.executive.stop_reason
+            {
+                record.status = InvestigationStatus::Failed;
+                record.error = Some(rationale.clone());
+                let _ = self.store.save(&record).await;
+                return Err(rationale.clone());
             }
 
+            record.status = InvestigationStatus::Completed;
             self.store.save(&record).await.map_err(|e| e.to_string())?;
             Ok(record.clone())
         }
@@ -413,190 +348,6 @@ impl Orchestrator {
                 Err(error)
             }
         }
-    }
-}
-
-async fn run_specialist_subproblem(
-    sub: ResearchSubproblem,
-    ctx: Arc<SpecialistContext>,
-    prior_tools: Vec<ToolExecution>,
-    prior_reports: Vec<AgentReport>,
-) -> SpecialistTaskResult {
-    let start = Instant::now();
-
-    let out_res: Result<SpecialistOutput, _> = provider::generate_structured(
-        ctx.provider.as_ref(),
-        GenerationRequest {
-            stage: GenerationStage::Specialist,
-            specialist: Some(sub.specialist.clone()),
-            system_instruction: format!(
-                "{} Return JSON matching {{analysis,claims,tool_calls,assumptions,uncertainties,evidence_requirements}}. Claims must not be labelled verified or evidence_supported without independent proof or actual sources. Allowed tools: {:?}. Never issue code or shell commands.",
-                sub.specialist.instructions(),
-                sub.specialist.allowed_tools()
-            ),
-            input: json!({
-                "question": ctx.question,
-                "task": sub.task,
-                "plan": ctx.plan,
-                "tool_results": prior_tools,
-                "dependency_reports": prior_reports,
-            }),
-        },
-        ctx.budget.as_ref(),
-    )
-    .await;
-
-    let out = match out_res {
-        Ok(o) => o,
-        Err(err) => {
-            // Failure isolation: record failure without terminating other tasks
-            let report = AgentReport {
-                specialist: sub.specialist.clone(),
-                status: AgentExecutionStatus::Failed,
-                analysis: format!("Specialist model execution failed: {err}"),
-                claims: vec![],
-                tool_calls: vec![],
-                assumptions: vec![],
-                uncertainties: vec![format!("Model failure: {err}")],
-                evidence_requirements: vec![],
-                duration_ms: start.elapsed().as_millis() as u64,
-            };
-            return SpecialistTaskResult {
-                subproblem_id: sub.id,
-                report,
-                tools: vec![],
-                verifications: vec![],
-            };
-        }
-    };
-
-    let mut report = AgentReport {
-        specialist: sub.specialist.clone(),
-        status: if ctx.provider.is_mock() {
-            AgentExecutionStatus::Mock
-        } else {
-            AgentExecutionStatus::Completed
-        },
-        analysis: out.analysis,
-        claims: out.claims,
-        tool_calls: out.tool_calls.clone(),
-        assumptions: out.assumptions,
-        uncertainties: out.uncertainties,
-        evidence_requirements: out.evidence_requirements,
-        duration_ms: start.elapsed().as_millis() as u64,
-    };
-
-    let mut tools = Vec::new();
-    let mut verifications = Vec::new();
-
-    for (call_index, call) in out.tool_calls.into_iter().enumerate() {
-        if call_index >= 3 {
-            tools.push(ToolExecution {
-                id: Uuid::new_v4().to_string(),
-                specialist: sub.specialist.clone(),
-                tool: call.tool,
-                arguments: call.arguments,
-                output: None,
-                method: None,
-                epistemic_status: EpistemicStatus::Uncertain,
-                verification_id: None,
-                error: Some("Specialist tool-call limit reached (3 per role)".into()),
-                duration_ms: 0,
-            });
-            continue;
-        }
-
-        if !sub.specialist.allowed_tools().contains(&call.tool.as_str()) {
-            tools.push(ToolExecution {
-                id: Uuid::new_v4().to_string(),
-                specialist: sub.specialist.clone(),
-                tool: call.tool,
-                arguments: call.arguments,
-                output: None,
-                method: None,
-                epistemic_status: EpistemicStatus::Uncertain,
-                verification_id: None,
-                error: Some("Tool rejected by the specialist allowlist".into()),
-                duration_ms: 0,
-            });
-            continue;
-        }
-
-        let started = Instant::now();
-        let invoke_res = worker::invoke(
-            ctx.python.clone(),
-            ctx.worker_script.clone(),
-            "/api/tool",
-            json!({"name": call.tool, "args": call.arguments}),
-            ctx.worker_timeout,
-        )
-        .await;
-
-        let (worker_val, err_msg) = match invoke_res {
-            Ok(val) => {
-                let output = val.get("result").cloned().unwrap_or(val);
-                (Ok(output), None)
-            }
-            Err(e) => (Err(format!("{e:?}")), Some(format!("{e:?}"))),
-        };
-
-        // Independent deterministic verification in Rust
-        let (v_res, epistemic_status) =
-            verification::verify_tool(&call.tool, &call.arguments, &worker_val);
-        let v_id = v_res.id.clone();
-        verifications.push(v_res);
-
-        let output_val = worker_val.ok();
-        let method = output_val
-            .as_ref()
-            .and_then(|v| v.get("method").and_then(Value::as_str))
-            .map(str::to_owned);
-
-        tools.push(ToolExecution {
-            id: Uuid::new_v4().to_string(),
-            specialist: sub.specialist.clone(),
-            tool: call.tool,
-            arguments: call.arguments,
-            output: output_val,
-            method,
-            epistemic_status,
-            verification_id: Some(v_id),
-            error: err_msg,
-            duration_ms: started.elapsed().as_millis() as u64,
-        });
-    }
-
-    // Epistemic status enforcement for specialist claims
-    // A model cannot claim 'verified' without an independently verified tool
-    for claim in &mut report.claims {
-        let backed = false; // Scholarly retrieval is configured in later milestones
-        let verified = claim.tool_ids.iter().any(|id| {
-            tools
-                .iter()
-                .any(|t| &t.id == id && t.epistemic_status == EpistemicStatus::Verified)
-        });
-        let calculated = claim.tool_ids.iter().any(|id| {
-            tools
-                .iter()
-                .any(|t| &t.id == id && t.epistemic_status == EpistemicStatus::Calculated)
-        });
-
-        if !backed {
-            claim.epistemic_status = if verified {
-                EpistemicStatus::Verified
-            } else if calculated {
-                EpistemicStatus::Calculated
-            } else {
-                EpistemicStatus::Hypothesis
-            };
-        }
-    }
-
-    SpecialistTaskResult {
-        subproblem_id: sub.id,
-        report,
-        tools,
-        verifications,
     }
 }
 

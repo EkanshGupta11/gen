@@ -185,6 +185,24 @@ impl LoopDetector {
         }
     }
 
+    pub fn from_history(history: Vec<String>, max_history: usize) -> Self {
+        let mut deque = VecDeque::with_capacity(max_history);
+        for item in history {
+            deque.push_back(item);
+            if deque.len() > max_history {
+                deque.pop_front();
+            }
+        }
+        Self {
+            recent_action_signatures: deque,
+            max_history,
+        }
+    }
+
+    pub fn history(&self) -> Vec<String> {
+        self.recent_action_signatures.iter().cloned().collect()
+    }
+
     pub fn record_and_check_loop(&mut self, action: &ExecutiveAction) -> bool {
         let signature = format!("{}:{:?}", action.name(), action.associated_goal_id());
         self.recent_action_signatures.push_back(signature.clone());

@@ -118,12 +118,132 @@ impl ExecutiveAction {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionExecutionStatus {
+    Succeeded,
+    Failed,
+    Contradicted,
+    Uncertain,
+    Blocked,
+    Unsupported,
+    AwaitingHumanInput,
+    Cancelled,
+}
+
+impl ActionExecutionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Contradicted => "contradicted",
+            Self::Uncertain => "uncertain",
+            Self::Blocked => "blocked",
+            Self::Unsupported => "unsupported",
+            Self::AwaitingHumanInput => "awaiting_human_input",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActionResult {
     pub action_id: String,
     pub action_name: String,
+    pub status: ActionExecutionStatus,
     pub success: bool,
     pub output: Value,
     pub error: Option<String>,
     pub duration_ms: u64,
+}
+
+impl ActionResult {
+    pub fn new(
+        action_id: impl Into<String>,
+        action_name: impl Into<String>,
+        status: ActionExecutionStatus,
+        output: Value,
+        error: Option<String>,
+        duration_ms: u64,
+    ) -> Self {
+        let is_success = status.is_success();
+        Self {
+            action_id: action_id.into(),
+            action_name: action_name.into(),
+            status,
+            success: is_success,
+            output,
+            error,
+            duration_ms,
+        }
+    }
+
+    pub fn succeeded(
+        action_id: impl Into<String>,
+        action_name: impl Into<String>,
+        output: Value,
+        duration_ms: u64,
+    ) -> Self {
+        Self::new(
+            action_id,
+            action_name,
+            ActionExecutionStatus::Succeeded,
+            output,
+            None,
+            duration_ms,
+        )
+    }
+
+    pub fn failed(
+        action_id: impl Into<String>,
+        action_name: impl Into<String>,
+        error: impl Into<String>,
+        duration_ms: u64,
+    ) -> Self {
+        Self::new(
+            action_id,
+            action_name,
+            ActionExecutionStatus::Failed,
+            Value::Null,
+            Some(error.into()),
+            duration_ms,
+        )
+    }
+
+    pub fn unsupported(
+        action_id: impl Into<String>,
+        action_name: impl Into<String>,
+        reason: impl Into<String>,
+        duration_ms: u64,
+    ) -> Self {
+        Self::new(
+            action_id,
+            action_name,
+            ActionExecutionStatus::Unsupported,
+            Value::Null,
+            Some(reason.into()),
+            duration_ms,
+        )
+    }
+
+    pub fn contradicted(
+        action_id: impl Into<String>,
+        action_name: impl Into<String>,
+        output: Value,
+        reason: impl Into<String>,
+        duration_ms: u64,
+    ) -> Self {
+        Self::new(
+            action_id,
+            action_name,
+            ActionExecutionStatus::Contradicted,
+            output,
+            Some(reason.into()),
+            duration_ms,
+        )
+    }
 }

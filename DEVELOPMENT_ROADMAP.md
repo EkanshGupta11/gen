@@ -29,35 +29,18 @@ This document outlines completed milestones, current progress, and future develo
 - Configured per-role model request routing.
 - Validated provider token budgeting and exponential backoff retry policies.
 
-### Milestone 1.3: Cognitive Control Foundation (Current Milestone)
-- **Phase A — Orchestration Bug Fixes:**
-  - Removed specialist role deduplication; subproblems are identified strictly by unique task IDs (`sub.id`). Multiple distinct tasks under the same specialist role (e.g. multiple mathematics subproblems) are preserved and executed.
-  - Corrected dependency context propagation: downstream tasks receive completed tool outputs and reports from all direct and transitive dependencies.
-  - Handled dependency failure surfacing: downstream tasks depending on failed tasks are surfaced as failed without executing.
-  - Unified serial (`max_concurrency: 1`) and concurrent (`max_concurrency: 2..=5`) dependency scheduling.
-- **Phase B — Cognitive State Model:**
-  - Created strongly typed, versioned `CognitiveState` (`src/cognition/state.rs`) representing investigation context, hierarchical goals, hypotheses, knowledge items, working memory, executive controller state, and contradiction tracking.
-- **Phase C — Bounded Working Memory Engine:**
-  - Implemented `WorkingMemory` (`src/cognition/working_memory.rs`) with configurable capacity (default: 64).
-  - Developed deterministic retention scoring incorporating activation, priority, epistemic status, and unresolved status.
-  - Protected pinned items and unresolved contradictions from eviction.
-  - Provided serializable snapshot and restoration capabilities.
-- **Phase D — Goal & Agenda Management:**
-  - Implemented hierarchical goals with parent-child trees and dependency propagation (`src/cognition/goals.rs`).
-  - Enforced typed completion criteria: goals cannot be declared complete without verifying explicit criteria (e.g. verified tool execution).
-- **Phase E — Selective Attention & Prioritisation:**
-  - Built `AttentionEngine` (`src/cognition/attention.rs`) with deterministic scoring based on readiness, contradiction resolution, base priority, uncertainty, and missing variables.
-  - Enforced deterministic tie-breaking.
-- **Phase F — Executive Controller:**
-  - Implemented 10-phase discrete control cycle (`src/cognition/executive.rs`).
-  - Enforced strict action allowlist, precondition checking, budget limits, timeouts, and rolling infinite loop detection.
-- **Phase G — Metacognitive Monitoring:**
-  - Implemented typed evaluation of goal progress, repeated failures, unverified calculations, and unresolved contradictions.
-- **Phase H — Persistence & Resumption:**
-  - Upgraded SQLite schema to version 2 (`src/store.rs`), adding `cognitive_state_json` and append-only `cognitive_events` table.
-  - Verified cross-process state recovery and resumption without re-executing completed goals.
-- **Phase I — Transparent Frontend Visibility:**
-  - Updated research interface (`web/index.html`) to display active goals, working memory items, executive phase, cycle count, attention focus, and stop reasons.
+### Milestone 1.3: Cognitive Control Foundation
+- Implemented modular cognitive state, bounded working memory, hierarchical goals, selective attention, executive controller, and schema version 2 SQLite persistence.
+
+### Milestone 1.3.1: Cognitive Runtime Integration & Epistemic Integrity (Current Milestone)
+- **Production Cognitive Runtime:** Implemented `CognitiveRuntime` and `AsyncActionExecutor`, transferring orchestration authority from passive pipelines to active discrete cognitive control cycles.
+- **Real Scientific Computation Execution:** Replaced placeholder mocking in the controller with real asynchronous execution via `worker::invoke` in CPython 3.13 against `engine/app.py`.
+- **Non-Bypassable Verification:** Enforced mandatory independent Rust verification checkers for all deterministic tool executions, preventing self-certification of epistemic statuses.
+- **Evidence-Based Contradiction Arbitration:** Implemented structured `ContradictionResolution` requiring defensible verified evidence to resolve contradiction records.
+- **Honest Action Execution Status:** Introduced `ActionExecutionStatus` ontology (`Succeeded`, `Failed`, `Contradicted`, `Uncertain`, `Blocked`, `Unsupported`, `AwaitingHumanInput`, `Cancelled`), ensuring unsupported actions never report false success.
+- **Goal Completion Criteria Scoping & Failure Isolation:** Strictly scoped completion criteria to specific subproblem goal IDs. Subproblem failures cleanly isolate downstream dependencies without aborting overall investigation synthesis.
+- **State Recovery & Budget Preservation:** Fully integrated SQLite snapshot and append-only event persistence, restoring historical budgets (`total_actions_executed`) and rolling loop detection histories on restart.
+- **Test Suite Expansion:** Expanded test suite to 42 passing Rust unit/integration tests and verified end-to-end browser DOM rendering.
 
 ---
 

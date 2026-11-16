@@ -15,12 +15,14 @@ The mock provider exercises the workflow without credentials, explicitly labelin
 
 ## Current Capabilities
 
-- **Cognitive Control Foundation (Milestone 1.3):**
+- **Cognitive Control Foundation & Runtime Integration (Milestones 1.3 & 1.3.1):**
+  - *Authoritative Cognitive Runtime:* Discrete cognitive loop (`CognitiveRuntime` & `AsyncActionExecutor`) driving production investigations, executing real scientific computations via the Python worker, and atomically persisting state after each action.
   - *Bounded Working Memory Engine:* Configurable capacity (default: 64) with deterministic retention scoring, activation decay, retrieval reinforcement, and strict protection for pinned items and unresolved contradictions.
-  - *Hierarchical Goal & Agenda Management:* Directed goal trees with dependency resolution, preconditions, and strictly verified completion criteria. Tasks are never marked complete solely because an agent asserts it.
+  - *Hierarchical Goal & Agenda Management:* Directed goal trees with dependency resolution, preconditions, failure isolation, and strictly verified completion criteria.
   - *Selective Attention & Prioritisation:* Deterministic attention engine scoring goals on readiness, contradiction resolution, base priority, uncertainty, and missing information with deterministic tie-breaking.
   - *10-Phase Executive Controller:* Discrete loop (`Observe -> UpdateState -> EvaluateGoals -> Attention -> SelectAction -> ValidatePreconditions -> ExecuteAction -> EvaluateOutcome -> UpdateWorkingMemory -> MetacognitiveEvaluation -> ContinueOrStop`). Features rolling loop detection, cycle/action budgets, and deadlock handling.
   - *Metacognitive Monitoring:* Typed health evaluations evaluating progress, repeated failures, unverified calculations, and contradictions.
+  - *Evidence-Based Contradiction Arbitration:* Structured contradiction resolution records requiring verified independent evidence to resolve.
 - **Strict Epistemic Classification:** Rigorous separation of claims into six mutually exclusive statuses: `verified`, `calculated`, `evidence_supported`, `hypothesis`, `uncertain`, and `contradicted`. A model is never permitted to self-assign `verified` status.
 - **Independent Scientific Verification:** Deterministic closed-form checkers natively implemented in Rust (`src/verification.rs`):
   - *Projectile Motion:* Closed-form Newtonian kinematics ($R = v^2\sin(2\theta)/g$, $T = 2v\sin\theta/g$, $H = v^2\sin^2\theta/(2g)$), boundary validations ($\theta=0^\circ, 90^\circ$), input constraints ($v \ge 0, g > 0$), and contradiction detection.
@@ -38,7 +40,7 @@ The mock provider exercises the workflow without credentials, explicitly labelin
 
 - `scripts/check.ps1`: runs `cargo fmt --check`, `cargo clippy`, `cargo check`, and Python compilation checks.
 - `scripts/test.ps1`: runs the complete test suite including:
-  1. Rust unit & offline integration tests (**38 tests**, 0 failures).
+  1. Rust unit & offline integration tests (**42 tests**, 0 failures).
   2. Python calculation worker unit tests (**11 tests**, 0 failures).
   3. Frontend JavaScript syntax verification.
   4. Automated cross-process database persistence recovery test.

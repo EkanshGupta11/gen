@@ -4,7 +4,7 @@
 
 - **Repository:** `https://github.com/EkanshGupta11/gen.git` (Public repository)
 - **Local Canonical Workspace:** `C:\Users\Ekansh\Documents\Codex\NeuroGenesis`
-- **Active Development Branch:** `m1.3-cognitive-control`
+- **Active Development Branch:** `m1.3.1-cognitive-runtime`
 - **Core Technology Stack:**
   - Systems Core: Rust 2024 edition (`axum`, `tokio`, `rusqlite`, `serde`, `reqwest`)
   - Scientific Runtime: CPython 3.13.15 managed by Astral `uv` (`numpy`, `scipy`, `sympy`, `pandas`, `matplotlib`)
@@ -41,14 +41,16 @@ src/
 ├── store.rs          # Rust-owned SQLite persistence with versioned migrations (schema v2)
 ├── verification.rs   # Deterministic closed-form Rust checkers (projectile, arithmetic, statistics, power-law)
 ├── worker.rs         # Subprocess invocation bridge to CPython 3.13 scientific runtime
-└── cognition/        # Milestone 1.3 Cognitive Control Foundation
+└── cognition/        # Milestone 1.3 & 1.3.1 Cognitive Runtime & Control Foundation
     ├── mod.rs             # Subsystem re-exports and unit tests
     ├── actions.rs         # Typed executive actions, subgoal definitions, and stop reasons
     ├── attention.rs       # Selective attention engine with deterministic scoring
     ├── events.rs          # Auditable append-only cognitive event contracts
     ├── executive.rs       # 10-phase executive control loop and loop prevention
+    ├── executor.rs        # Asynchronous external action executor with Python worker & verification
     ├── goals.rs           # Hierarchical goals, dependency graphs, and completion criteria
     ├── policy.rs          # Action precondition checks and rolling loop detector
+    ├── runtime.rs         # Authoritative async cognitive runtime with event/state persistence
     ├── state.rs           # Strongly typed serializable CognitiveState
     └── working_memory.rs  # Bounded working memory with retention scoring and protection
 engine/

@@ -1,5 +1,5 @@
 # NeuroGenesis AI — Cognitive Architecture Specification
-## Milestone 1.3: Cognitive Control Foundation
+## Milestone 1.3 & 1.3.1: Cognitive Control Foundation & Runtime Integration
 
 ---
 
@@ -222,4 +222,15 @@ SQLite store upgraded to schema version `2`:
   CREATE INDEX IF NOT EXISTS idx_cognitive_events_inv 
       ON cognitive_events(investigation_id, cycle, timestamp);
   ```
-- **Cross-Process Resumption:** An investigation paused or persisted to SQLite can be restored into a fresh `ExecutiveController` instance. It restores working memory items, goal statuses, and cycle counts, and continues execution with the next eligible action without repeating already completed steps.
+- **Cross-Process Resumption:** An investigation paused or persisted to SQLite can be restored into a fresh `ExecutiveController` instance. It restores working memory items, goal statuses, cycle counts, budget consumption, and loop detection history, continuing execution with the next eligible action without repeating already completed steps.
+
+---
+
+## 9. Cognitive Runtime & Epistemic Integrity (Milestone 1.3.1)
+
+In Milestone 1.3.1, the cognitive subsystems were integrated into the primary execution loop:
+- **`CognitiveRuntime` & `AsyncActionExecutor`:** Drives the investigation lifecycle, executing real scientific computations via the Python worker, and managing atomic SQLite state persistence after each cycle.
+- **Non-Bypassable Epistemic Integrity:** Epistemic statuses cannot be self-certified by external models. `Verified` status strictly requires independent deterministic Rust checker validation within numerical tolerance.
+- **Structured Contradiction Arbitration:** Contradictions require verified independent evidence and persist as structured `ContradictionResolution` records.
+- **Budget & Loop Detection Preservation:** Resumed investigations preserve `total_actions_executed` and historical loop signatures across server restarts.
+- **Reference:** See `docs/COGNITIVE_RUNTIME.md` for full architecture specifications.

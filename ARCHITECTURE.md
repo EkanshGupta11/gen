@@ -1,5 +1,5 @@
 # NeuroGenesis AI Architecture
-## Milestone 1.3: Cognitive Control Foundation
+## Milestone 1.3 & 1.3.1: Cognitive Control Foundation & Runtime Integration
 
 ---
 
@@ -53,8 +53,8 @@
 ### Component Roles
 
 1. **Rust Core Application:**
-   - **Cognitive Control (`src/cognition/`):** Manages working memory, attention prioritisation, hierarchical goals, completion criteria verification, and executive control loops.
-   - **Investigation Orchestrator (`src/orchestrator.rs`):** Schedules domain specialists across asynchronous tasks, resolving DAG dependencies and propagating tool outputs downstream.
+   - **Cognitive Runtime & Executive Controller (`src/cognition/`):** Authoritative discrete cognitive loop (`CognitiveRuntime`), async execution dispatch (`AsyncActionExecutor`), working memory, attention prioritisation, hierarchical goals, completion criteria verification, and loop prevention.
+   - **Investigation Orchestrator (`src/orchestrator.rs`):** Translates research plans into initial cognitive state, sets up structured goals and agenda items, and delegates lifecycle execution to the `CognitiveRuntime`.
    - **Deterministic Verification (`src/verification.rs`):** Independently evaluates computational outputs in native Rust without model self-verification.
    - **Persistence (`src/store.rs`):** Exclusively owns SQLite database reads, writes, schema migrations (version 2), and auditable append-only cognitive events.
 2. **Python Scientific Computation Worker (`engine/app.py`):**

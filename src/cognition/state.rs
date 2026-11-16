@@ -118,6 +118,37 @@ pub struct KnowledgeItem {
     pub timestamp: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionOutcome {
+    Resolved,
+    PartiallyResolved,
+    Unresolved,
+    RequiresHumanReview,
+}
+
+impl ResolutionOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::PartiallyResolved => "partially_resolved",
+            Self::Unresolved => "unresolved",
+            Self::RequiresHumanReview => "requires_human_review",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContradictionResolution {
+    pub contradiction_id: String,
+    pub conflicting_items: Vec<String>,
+    pub proposed_resolution: String,
+    pub supporting_evidence_refs: Vec<String>,
+    pub verification_method: String,
+    pub outcome: ResolutionOutcome,
+    pub timestamp: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ContradictionRecord {
     pub id: String,
@@ -125,7 +156,7 @@ pub struct ContradictionRecord {
     pub conflicting_items: Vec<String>,
     pub resolved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
+    pub resolution: Option<ContradictionResolution>,
     pub detected_at: String,
 }
 
@@ -137,7 +168,11 @@ pub struct ExecutiveControllerState {
     pub selected_action: Option<ExecutiveAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_action_outcome: Option<ActionResult>,
+    #[serde(default)]
+    pub total_actions_executed: u32,
     pub remaining_action_budget: u32,
+    #[serde(default)]
+    pub loop_detection_history: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
 }
@@ -182,7 +217,9 @@ impl CognitiveState {
                 current_phase: ExecutivePhase::Idle,
                 selected_action: None,
                 previous_action_outcome: None,
+                total_actions_executed: 0,
                 remaining_action_budget: action_budget,
+                loop_detection_history: Vec::new(),
                 stop_reason: None,
             },
             contradictions: Vec::new(),

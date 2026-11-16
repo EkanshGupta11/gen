@@ -226,6 +226,18 @@ impl WorkingMemory {
         self.items.get(id)
     }
 
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut WorkingMemoryItem> {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        if let Some(item) = self.items.get_mut(id) {
+            item.last_accessed = now;
+            item.access_count += 1;
+            item.activation = (item.activation + 0.1).min(1.0);
+        }
+        self.items.get_mut(id)
+    }
+
     pub fn peek(&self, id: &str) -> Option<&WorkingMemoryItem> {
         self.items.get(id)
     }

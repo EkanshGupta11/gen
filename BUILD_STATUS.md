@@ -1,10 +1,10 @@
-# Build Status — Milestone 1.3: Cognitive Control Foundation
+# Build Status — Milestone 1.3.1: Cognitive Runtime Integration & Epistemic Integrity
 
 ## Canonical Repository & Collaboration Environment
 
 - **Canonical Development Workspace:** `C:\Users\Ekansh\Documents\Codex\NeuroGenesis`
 - **Remote Git Repository:** `https://github.com/EkanshGupta11/gen.git`
-- **Active Development Branch:** `m1.3-cognitive-control`
+- **Active Development Branch:** `m1.3.1-cognitive-runtime` (descended from `origin/m1.3-cognitive-control`)
 - **Shared Collaboration:** Configured for cross-agent development between ChatGPT, Antigravity, and human engineers. The repository contains strictly version-controlled source code with zero build artifacts, caches, or secrets.
 - **Database Integrity:** Local SQLite databases (`data/neurogenesis.sqlite3` and migration backups) and runtime settings (`.env`) are active and preserved in the canonical clone, strictly excluded from Git via `.gitignore`.
 - **Python Environment:** Standard CPython 3.13.15 virtual environment (`.venv-cpython313`) managed by Astral `uv` with pre-installed scientific dependencies: `numpy 2.5.5`, `scipy 1.18.1`, `sympy 1.14.0`, `pandas 3.1.1`, `matplotlib 3.11.2`.
@@ -12,58 +12,48 @@
 
 ---
 
-## Milestone 1.3 Completed Deliverables
+## Milestone 1.3.1 Completed Deliverables
 
-### Phase A: Orchestration Defect Fixes (`src/orchestrator.rs`)
-- **Defect A (Specialist Deduplication):** Removed specialist role deduplication. Subproblems are identified strictly by unique task IDs (`sub.id`). Plans containing multiple subproblems under the same specialist role (e.g. multiple distinct mathematics tasks) now preserve and execute all tasks independently.
-- **Defect B (Dependency Context Propagation):** Re-architected execution model to pass completed tool executions and specialist reports from direct and transitive dependencies into downstream tasks (`tool_results` and `dependency_reports`).
-- **Dependency Failure Surfacing:** Downstream tasks depending on failed tasks are surfaced immediately with `AgentExecutionStatus::Failed` and explicit explanation, preventing execution of broken tasks while preserving sibling failure isolation.
-- **Unified Scheduler:** Serial (`max_concurrency: 1`) and concurrent (`max_concurrency: 2..=5`) modes use the same dependency-driven scheduling logic.
-- **Regression Tests:** Added 3 dedicated regression tests covering role preservation, context propagation, and dependency failure surfacing.
+### 1. Production Integration of Executive Controller (`src/orchestrator.rs` & `src/cognition/runtime.rs`)
+- Replaced the passive orchestration pipeline with an authoritative, discrete-cycle cognitive runtime: `CognitiveRuntime`.
+- `Orchestrator` seeds the research question as the cognitive context, establishes structured subproblem goals and dependency-linked synthesis goals, and registers executable agenda actions.
+- The `ExecutiveController` directly drives every decision: observing state, evaluating completion criteria, directing selective attention, selecting next actions, validating preconditions, and performing metacognitive monitoring.
 
-### Phase B: Cognitive State Model (`src/cognition/state.rs`)
-- Strongly typed, versioned (`schema_version: "1.0"`), serializable `CognitiveState`.
-- Represents `InvestigationContext`, `GoalManager`, `Hypotheses`, `KnowledgeItems` (with provenance), `WorkingMemory`, `ExecutiveControllerState`, and `ContradictionRecord`s.
+### 2. Grounded Scientific Tool Execution (`src/cognition/executor.rs`)
+- Eliminated placeholder mocking (`Ok(json!({"executed_locally": true}))`).
+- Replaced with real asynchronous worker execution via `worker::invoke` in CPython 3.13 against `engine/app.py`.
+- Scientific calculations are typed into `ToolExecution` and stored in `KnowledgeItem`s with full execution metadata, arguments, outputs, and duration metrics.
 
-### Phase C: Bounded Working Memory Engine (`src/cognition/working_memory.rs`)
-- Configurable capacity (default: 64 items, bounds: 4..=512).
-- Retention score algorithm combining activation, priority, epistemic status, and unresolved status:
-  $$\text{Score} = (\text{activation} \times 40.0) + (\text{priority} \times 0.3) + \text{epistemic\_bonus} + \text{unresolved\_bonus}$$
-- Activation decay ($0.05$/cycle) and retrieval reinforcement ($+0.1$).
-- Pinned items and unresolved contradictions are strictly protected from eviction.
-- Serializable `WorkingMemorySnapshot` and restoration.
+### 3. Non-Bypassable Independent Rust Verification (`src/verification.rs` & `src/cognition/executor.rs`)
+- Epistemic status cannot be self-certified or hallucinated by models.
+- Every deterministic tool calculation is routed through independent Rust checkers (`verification::verify_tool`).
+- Status transitions strictly based on numerical comparison against the independent ground truth (tolerance $10^{-4}$):
+  - Consistent outputs $\to$ `EpistemicStatus::Verified`
+  - Divergent outputs $\to$ `EpistemicStatus::Contradicted`
+  - Unchecked calculations $\to$ `EpistemicStatus::Calculated`
 
-### Phase D: Goal & Agenda Management (`src/cognition/goals.rs`)
-- Hierarchical goal trees (`parent_goal`), dependencies, preconditions, and statuses (`Pending`, `Active`, `Completed`, `Blocked`, `Failed`, `Cancelled`).
-- Strict completion criteria enforcement: tasks cannot be declared complete solely by declaration; all criteria (`ToolExecuted`, `CalculationVerified`, `SubGoalsCompleted`, etc.) must be satisfied.
-- Recursive cancellation of child goals and agenda actions.
+### 4. Evidence-Based Contradiction Arbitration (`src/cognition/state.rs` & `src/cognition/executor.rs`)
+- Contradictions are managed via typed `ContradictionRecord`s.
+- `ResolveContradiction` requires defensible, independently verified evidence; unverified or contradicted items cannot be marked resolved.
+- Produces a structured `ContradictionResolution` specifying supporting evidence references, verification method, and timestamp.
 
-### Phase E: Selective Attention & Prioritisation (`src/cognition/attention.rs`)
-- Deterministic scoring policy:
-  $$\text{AttentionScore} = (\text{Readiness} \times 40.0) + (\text{ContradictionBonus} \times 25.0) + (\text{Priority} \times 20.0) + (\text{UncertaintyBonus} \times 10.0) + (\text{MissingInfoBonus} \times 5.0)$$
-- Deterministic tie-breaking: $\text{Score} \to \text{Priority} \to \text{Timestamp} \to \text{ID}$.
-- Produces structured, auditable `AttentionDecisionRecord`.
+### 5. Honest Action Status & Failure Semantics (`src/cognition/actions.rs`)
+- Added `ActionExecutionStatus`: `Succeeded`, `Failed`, `Contradicted`, `Uncertain`, `Blocked`, `Unsupported`, `AwaitingHumanInput`, `Cancelled`.
+- Unimplemented or un-migrated actions return `Unsupported`, never false positive success.
 
-### Phase F: Executive Controller (`src/cognition/executive.rs`)
-- 10-phase discrete loop: `Observe -> EvaluateGoals -> UpdateState -> Attention -> SelectAction -> ValidatePreconditions -> ExecuteAction -> EvaluateOutcome -> UpdateWorkingMemory -> MetacognitiveEvaluation -> ContinueOrStop`.
-- Strict action allowlist: `ExecuteScientificTool`, `VerifyCalculation`, `DecomposeGoal`, `ResolveContradiction`, `UpdateCognitiveState`, `StopInvestigation`, etc.
-- Precondition validation via `src/cognition/policy.rs`.
-- Rolling infinite loop detector tracking action signatures.
-- Enforced bounds: `max_cycles` (50), `max_actions` (100), `timeout` (30s), deadlock detection, and clean stopping reasons.
+### 6. Goal Completion Enforcement & Failure Isolation (`src/cognition/goals.rs` & `src/cognition/executive.rs`)
+- Goals cannot be marked completed solely by assertion.
+- Subproblem goal completion criteria (`SpecialistReportReceived`, `ToolExecuted`, `CalculationVerified`) are scoped strictly to the respective `goal_id`.
+- Failed subproblems cleanly surface errors and transition downstream tasks to `Blocked`.
+- Synthesis goals isolate failures and activate once all upstream subproblems have reached a terminal or blocked state, guaranteeing honest research summaries.
 
-### Phase G: Metacognitive Monitoring (`src/cognition/executive.rs`)
-- Typed health evaluations: goal completion progress, repeated failures ($\ge 3$), unverified calculations, unresolved contradictions, and open hypotheses.
-- Recommends explicit cognitive course corrections (`Proceed`, `TriggerVerification`, `ResolveContradiction`, `DecomposeGoal`, `AbortDeadlock`, `CompleteInvestigation`).
+### 7. Full SQLite Persistence & Resumption (`src/store.rs` & `src/cognition/runtime.rs`)
+- Removed all `#[allow(dead_code)]` from cognitive persistence methods in `Store`.
+- State snapshots and append-only cognitive events are committed to SQLite after each discrete action.
+- `from_existing_state` preserves `total_actions_executed` and `loop_detection_history`, preventing loop recurrence and maintaining bounded execution budgets across process restarts.
 
-### Phase H: SQLite Persistence & Resumption (`src/store.rs`)
-- Upgraded SQLite schema to version 2:
-  - Added `cognitive_state_json TEXT` to `investigations` table.
-  - Added append-only `cognitive_events` table with index on `(investigation_id, cycle, timestamp)`.
-- Verified end-to-end persistence and resumption across fresh store instances: resumed investigations continue with the next eligible action without repeating completed steps.
-
-### Phase I: Transparent Frontend Visibility (`web/index.html`)
-- Displays active & tracked goals (with status badges), working memory summary, current attention focus, executive controller phase, cycle count, and stop reason.
-- Distinctly marks implemented local Rust capabilities vs offline mock indicators.
+### 8. Accurate Frontend Visibility (`web/index.html`)
+- Accurately renders executive controller state, current phase, cycle count, stop reason, active goal statuses, and working memory item counts from live backend data.
 
 ---
 
@@ -76,57 +66,52 @@ All checks and tests executed cleanly in `C:\Users\Ekansh\Documents\Codex\NeuroG
 | **Rust Formatting** | `cargo fmt --check` | **PASSED** | 0 formatting violations |
 | **Rust Compilation** | `cargo check` | **PASSED** | 0 errors |
 | **Clippy Linter** | `cargo clippy --locked --all-targets -- -D warnings` | **PASSED** | 0 warnings, 0 errors |
-| **Rust Test Suite** | `cargo test --locked` | **PASSED** | **38 passed, 0 failed, 0 ignored** |
-| **Python Test Suite** | `.venv-cpython313\Scripts\python.exe -m unittest discover -s engine -p "test_*.py" -v` | **PASSED** | **11 passed, 0 failed** (0.46s) |
+| **Rust Test Suite** | `cargo test --locked --offline` | **PASSED** | **42 passed, 0 failed, 0 ignored** |
+| **Python Test Suite** | `.venv-cpython313\Scripts\python.exe -m unittest discover -s engine -p "test_*.py"` | **PASSED** | **11 passed, 0 failed** (0.625s) |
 | **Frontend Syntax** | `node --check` | **PASSED** | Valid inline JavaScript syntax |
 | **Persistence Recovery** | `python scripts/test_persistence_recovery.py` | **PASSED** | Verified SQLite persistence across process restarts, tool outputs, and verification records |
 | **Browser E2E Verification** | `node scripts/test_browser_e2e.js` | **PASSED** | Headless Chrome verified UI loading, DOM rendering, `.pill.pill-verified` badges, and history |
 
-### Summary of the 38 Rust Tests:
-1. `cognition::tests::test_goal_completion_enforces_criteria` (passed)
-2. `cognition::tests::test_metacognitive_monitoring_detects_contradictions` (passed)
+### Complete List of the 42 Passing Rust Tests:
+1. `cognition::tests::test_budget_and_loop_history_preserved_across_from_existing_state` (passed)
+2. `cognition::tests::test_goal_completion_enforces_criteria` (passed)
 3. `cognition::tests::test_attention_prioritisation_and_tie_breaking` (passed)
-4. `cognition::tests::test_goal_hierarchies_dependencies_and_cancellation` (passed)
-5. `cognition::tests::test_working_memory_capacity_and_eviction` (passed)
-6. `cognition::tests::test_working_memory_retains_unresolved_contradictions` (passed)
-7. `cognition::tests::test_working_memory_snapshot_and_restoration` (passed)
-8. `cognition::tests::test_executive_controller_deterministic_execution_and_loop_prevention` (passed)
-9. `api::tests::rejects_oversized_body` (passed)
-10. `api::tests::unavailable_worker_is_reported` (passed)
-11. `api::tests::health_reports_contract_version` (passed)
-12. `api::tests::rejects_malformed_json_as_json_error` (passed)
-13. `provider::tests::enforces_token_budget_exhaustion` (passed)
-14. `provider::tests::maps_auth_and_timeout_failures_without_revealing_credentials` (passed)
-15. `provider::tests::retries_invalid_structured_json_once_then_fails_honestly` (passed)
-16. `provider::tests::retries_only_for_unsupported_new_token_parameter_with_legacy_fallback` (passed)
-17. `provider::tests::sends_current_openai_compatible_chat_request_and_accounts_usage` (passed)
-18. `provider::tests::retries_server_500_error_with_bounded_retry` (passed)
-19. `provider::tests::handles_rate_limit_with_one_bounded_retry` (passed)
-20. `api::tests::rejects_short_question_and_disallowed_tool` (passed)
-21. `verification::tests::test_arithmetic_verification` (passed)
-22. `verification::tests::test_power_law_retains_calculated_when_consistent_and_contradicts_when_invalid` (passed)
-23. `verification::tests::test_projectile_detects_corrupted_output` (passed)
-24. `verification::tests::test_projectile_rejects_invalid_inputs` (passed)
-25. `verification::tests::test_projectile_verification_boundary_zero_and_90_degrees` (passed)
-26. `verification::tests::test_projectile_verification_different_angles_and_velocities` (passed)
-27. `verification::tests::test_statistics_verification` (passed)
-28. `store::tests::migrates_legacy_schema_with_backup_and_preserves_rows` (passed)
-29. `orchestrator::tests::regression_failed_dependency_is_surfaced_to_downstream_tasks` (passed)
-30. `api::tests::worker_timeout_is_reported` (passed)
-31. `store::tests::persists_updates_and_retrieves_from_a_fresh_store_instance` (passed)
-32. `store::tests::cognitive_state_persistence_and_resumption_across_store_instances` (passed)
-33. `api::tests::executes_allowlisted_tool_in_python_worker` (passed)
-34. `orchestrator::tests::offline_investigation_runs_plan_specialist_tool_synthesis_and_persists` (passed)
-35. `orchestrator::tests::serial_specialist_execution_mode` (passed)
-36. `orchestrator::tests::specialist_failure_isolation_test` (passed)
-37. `orchestrator::tests::regression_specialist_deduplication_preserves_distinct_subproblems_same_role` (passed)
-38. `orchestrator::tests::regression_dependency_context_propagation_to_downstream_tasks` (passed)
-
----
-
-## Remaining Blockers and Limitations
-
-- **Live Hosted Model Inference:** Untested pending user-provided API credentials.
-- **Scholarly Literature Retrieval:** OpenAlex, Crossref, and PubMed integrations belong to Milestone 1.4 to support `evidence_supported` claims.
-- **Formal Mathematical Theorem Proving:** Lean 4 integration is designed as a future verification extension.
-- **Long-Term Memory & 3D Visualization:** Zep memory, Mol* 3D molecular visualization, and document ingestion are slated for future milestones.
+4. `cognition::tests::test_contradiction_resolution_requires_defensible_verified_evidence` (passed)
+5. `cognition::tests::test_goal_hierarchies_dependencies_and_cancellation` (passed)
+6. `cognition::tests::test_metacognitive_monitoring_detects_contradictions` (passed)
+7. `cognition::tests::test_executive_controller_deterministic_execution_and_loop_prevention` (passed)
+8. `cognition::tests::test_unimplemented_and_unsupported_actions_do_not_report_success` (passed)
+9. `cognition::tests::test_working_memory_retains_unresolved_contradictions` (passed)
+10. `cognition::tests::test_working_memory_capacity_and_eviction` (passed)
+11. `cognition::tests::test_verification_cannot_be_bypassed_without_independent_checker` (passed)
+12. `cognition::tests::test_working_memory_snapshot_and_restoration` (passed)
+13. `api::tests::rejects_oversized_body` (passed)
+14. `api::tests::unavailable_worker_is_reported` (passed)
+15. `provider::tests::enforces_token_budget_exhaustion` (passed)
+16. `api::tests::health_reports_contract_version` (passed)
+17. `provider::tests::maps_auth_and_timeout_failures_without_revealing_credentials` (passed)
+18. `provider::tests::retries_invalid_structured_json_once_then_fails_honestly` (passed)
+19. `api::tests::rejects_malformed_json_as_json_error` (passed)
+20. `provider::tests::retries_only_for_unsupported_new_token_parameter_with_legacy_fallback` (passed)
+21. `provider::tests::sends_current_openai_compatible_chat_request_and_accounts_usage` (passed)
+22. `provider::tests::retries_server_500_error_with_bounded_retry` (passed)
+23. `provider::tests::handles_rate_limit_with_one_bounded_retry` (passed)
+24. `api::tests::rejects_short_question_and_disallowed_tool` (passed)
+25. `verification::tests::test_arithmetic_verification` (passed)
+26. `verification::tests::test_power_law_retains_calculated_when_consistent_and_contradicts_when_invalid` (passed)
+27. `verification::tests::test_projectile_detects_corrupted_output` (passed)
+28. `verification::tests::test_projectile_rejects_invalid_inputs` (passed)
+29. `verification::tests::test_projectile_verification_boundary_zero_and_90_degrees` (passed)
+30. `verification::tests::test_projectile_verification_different_angles_and_velocities` (passed)
+31. `verification::tests::test_statistics_verification` (passed)
+32. `api::tests::worker_timeout_is_reported` (passed)
+33. `store::tests::migrates_legacy_schema_with_backup_and_preserves_rows` (passed)
+34. `store::tests::cognitive_state_persistence_and_resumption_across_store_instances` (passed)
+35. `store::tests::persists_updates_and_retrieves_from_a_fresh_store_instance` (passed)
+36. `orchestrator::tests::regression_failed_dependency_is_surfaced_to_downstream_tasks` (passed)
+37. `api::tests::executes_allowlisted_tool_in_python_worker` (passed)
+38. `orchestrator::tests::offline_investigation_runs_plan_specialist_tool_synthesis_and_persists` (passed)
+39. `orchestrator::tests::serial_specialist_execution_mode` (passed)
+40. `orchestrator::tests::specialist_failure_isolation_test` (passed)
+41. `orchestrator::tests::regression_specialist_deduplication_preserves_distinct_subproblems_same_role` (passed)
+42. `orchestrator::tests::regression_dependency_context_propagation_to_downstream_tasks` (passed)

@@ -88,7 +88,6 @@ impl Store {
         .map_err(|error| StoreError::Task(error.to_string()))?
     }
 
-    #[allow(dead_code)]
     pub async fn save_cognitive_state(
         &self,
         investigation_id: String,
@@ -108,7 +107,6 @@ impl Store {
         .map_err(|error| StoreError::Task(error.to_string()))?
     }
 
-    #[allow(dead_code)]
     pub async fn get_cognitive_state(
         &self,
         investigation_id: String,
@@ -136,7 +134,6 @@ impl Store {
         .map_err(|error| StoreError::Task(error.to_string()))?
     }
 
-    #[allow(dead_code)]
     pub async fn append_cognitive_events(
         &self,
         events: Vec<crate::cognition::CognitiveEvent>,
@@ -169,7 +166,6 @@ impl Store {
         .map_err(|error| StoreError::Task(error.to_string()))?
     }
 
-    #[allow(dead_code)]
     pub async fn get_cognitive_events(
         &self,
         investigation_id: String,
@@ -657,9 +653,6 @@ mod tests {
         // 2. Updating working memory & 3. Executing controller action (which completes goal 1)
         let cont = controller.step().unwrap();
         assert!(cont);
-        // Step again to evaluate completion criteria for step-1
-        let cont2 = controller.step().unwrap();
-        assert!(cont2);
 
         assert_eq!(
             controller.state.goals.get_goal("step-1").unwrap().status,

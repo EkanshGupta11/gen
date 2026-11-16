@@ -15,7 +15,7 @@ Rust (`src/store.rs`) exclusively owns all database interactions, schema definit
 
 ### Episodic & Event Memory (`src/cognition/events.rs` & `src/store.rs`)
 - **Append-Only Auditable Event Log:** Every state transition, goal status update, memory eviction, and executive action produces a typed `CognitiveEvent` persisted to SQLite's `cognitive_events` table.
-- **Versioned Persistence:** SQLite schema version 2 persists `cognitive_state_json` alongside investigation history, supporting seamless resumption of interrupted investigations.
+- **Versioned Persistence & Recovery (M1.3.1):** SQLite schema version 2 persists `cognitive_state_json` alongside investigation history, supporting seamless resumption of interrupted investigations. `from_existing_state` preserves historical execution budgets (`total_actions_executed`) and loop detection history to prevent loop recurrence upon restart.
 
 ## 3. Future Memory Horizons (Milestones 1.4+)
 

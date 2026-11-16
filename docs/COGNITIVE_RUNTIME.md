@@ -1,0 +1,126 @@
+# NeuroGenesis Cognitive Runtime Architecture (Milestone 1.3.1)
+
+## 1. Executive Summary & Objective
+
+In Milestone 1.3.1, the NeuroGenesis cognitive architecture transitioned from independently tested modular components into an active, authoritative cognitive runtime governing production scientific investigations.
+
+The architectural mandate is unequivocal:
+- **No LLM wrapper**: Reasoning, goal management, memory policies, action selection, and verification are owned by deterministic Rust systems code.
+- **Epistemic integrity**: Epistemic statuses (`Verified`, `Calculated`, `Contradicted`, `Hypothesis`, `Uncertain`, `EvidenceSupported`) cannot be self-assigned, hallucinated, or bypassed by external models.
+- **Evidence-based contradiction arbitration**: Contradictions require independent verification artifacts and structured resolution outcomes.
+- **Durable cognitive state**: Active goals, working memory, attention records, loop history, and execution budgets persist across application lifecycles in SQLite.
+
+---
+
+## 2. Core Architectural Components
+
+The runtime boundary enforces clean separation of concerns across four primary structs:
+
+```
+┌────────────────────────────────────────────────────────┐
+│                   Orchestrator                         │
+│   (Translates research questions, seeds goals & agenda)│
+└──────────────────────────┬─────────────────────────────┘
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│                 CognitiveRuntime                       │
+│   (Async event loop, persistence synchronization,      │
+│    cycle orchestration)                                │
+└─────────────┬────────────────────────────┬─────────────┘
+              │                            │
+              ▼                            ▼
+┌────────────────────────────┐ ┌─────────────────────────┐
+│    ExecutiveController     │ │   AsyncActionExecutor   │
+│ (Pure cognitive control,   │ │ (Async tool execution,  │
+│  observe, goal evaluation, │ │  Python worker invoke,  │
+│  attention focus, policy)  │ │  independent verifier)  │
+└────────────────────────────┘ └─────────────────────────┘
+```
+
+### 2.1 `CognitiveRuntime` (`src/cognition/runtime.rs`)
+- **Role**: Coordinates the discrete cycle lifecycle asynchronously.
+- **Cycle Flow**:
+  1. Calls `ExecutiveController::step_prepare()` to evaluate goals, focus attention, select the next action, and validate preconditions.
+  2. Dispatches the action to `AsyncActionExecutor::execute()` for real external interactions (worker invocation, model synthesis, verification).
+  3. Commits the resulting `ActionResult` into `ExecutiveController::step_commit()`, updating working memory, agenda items, and metacognitive monitoring.
+  4. Flushes state snapshots and append-only cognitive events into SQLite via `Store`.
+
+### 2.2 `ExecutiveController` (`src/cognition/executive.rs`)
+- **Role**: Deterministic state machine governing internal cognitive processes.
+- **Phases**:
+  `Observe` → `EvaluateGoals` → `UpdateState` → `AttentionPrioritisation` → `SelectAction` → `ValidatePreconditions` → `ExecuteAction` → `EvaluateOutcome` → `UpdateWorkingMemory` → `MetacognitiveEvaluation` → `Stopped`.
+- **Invariants**:
+  - Independent of network I/O; can run synchronously in memory for deterministic unit testing.
+  - Enforces hard execution bounds (`max_cycles`, `max_actions`, `timeout`).
+  - Restores exact historical budget and loop detector state on resumption.
+
+### 2.3 `AsyncActionExecutor` (`src/cognition/executor.rs`)
+- **Role**: Performs side-effecting operations while upholding epistemic guardrails.
+- **Capabilities**:
+  - `ExecuteScientificTool`: Validates tool against `ALLOWED_SCIENTIFIC_TOOLS`, executes via `worker::invoke` in CPython 3.13, runs deterministic Rust verifier (`verification::verify_tool`), and stores results as typed `ToolExecution` and `KnowledgeItem`.
+  - `RequestSpecialistAnalysis`: Invokes model provider with bounded retry and token accounting, executes requested specialist tool calls, bounds tool execution per role (max 3), and enforces epistemic downgrade on unverified claims.
+  - `VerifyCalculation`: Recovers calculation knowledge items by ID or tool name, executes independent Rust checkers, and updates epistemic status to `Verified` or `Contradicted`.
+  - `ResolveContradiction`: Arbitrates conflicting items based on independently verified evidence, rejecting unverified items.
+  - `SynthesizeFindings`: Summarizes multi-specialist outputs, explicitly barring models from self-certifying findings as `Verified`.
+
+---
+
+## 3. Epistemic Status & Integrity Rules
+
+Epistemic classification reflects empirical justification:
+
+| Epistemic Status | Source / Requirement | Can Model Self-Assign? |
+|---|---|:---:|
+| `Verified` | Must pass independent deterministic Rust checker within tolerance ($10^{-4}$) | **NO** |
+| `Calculated` | Deterministic worker execution without formal independent verification | **NO** |
+| `Contradicted` | Divergence between worker calculation and independent Rust checker | **NO** |
+| `EvidenceSupported` | Attached to verified empirical data or primary scholarly literature | **NO** |
+| `Hypothesis` | Candidate proposal or claim requiring empirical testing | YES |
+| `Uncertain` | Execution failure, boundary violation, or unverified mock output | YES |
+
+---
+
+## 4. Evidence-Based Contradiction Resolution
+
+Contradictions are tracked as first-class cognitive records (`ContradictionRecord`). Resolution requires structured evidence:
+
+```rust
+pub struct ContradictionResolution {
+    pub contradiction_id: String,
+    pub conflicting_items: Vec<String>,
+    pub proposed_resolution: String,
+    pub supporting_evidence_refs: Vec<String>,
+    pub verification_method: String,
+    pub outcome: ResolutionOutcome,
+    pub timestamp: String,
+}
+```
+
+- When `ResolveContradiction` executes, it verifies that at least one conflicting item has been verified by an independent checker.
+- Contradicted items are marked rejected, verified items are retained, and the record transitions to `ResolutionOutcome::Resolved`.
+- If no verified evidence is present, the contradiction remains unresolved with status `Uncertain`, blocking premature closure.
+
+---
+
+## 5. Persistence & Recovery Semantics
+
+Persistence is managed atomically through SQLite:
+1. **Snapshots**: Every completed action commits the full `CognitiveState` JSON into `investigations.cognitive_state_json`.
+2. **Event Sinks**: All discrete cycle events (`CycleStarted`, `ActionSelected`, `ActionExecuted`, `AttentionFocused`, `MetacognitiveEvaluation`, etc.) are appended to the `cognitive_events` table.
+3. **Resumption**:
+   - `CognitiveRuntime::recover(investigation_id, config, executor, store)` loads the serialized state.
+   - `ExecutiveController::from_existing_state()` restores:
+     - `total_actions_executed`: Preserves the remaining budget across crashes.
+     - `loop_detection_history`: Preserves action frequency counts to prevent infinite loop exploits across restarts.
+     - Completed and active goal structures and agenda items.
+   - Execution resumes seamlessly at the next eligible agenda item without re-executing completed prerequisites.
+
+---
+
+## 6. Metacognitive Monitoring & Loop Prevention
+
+The executive controller runs metacognitive monitoring on every discrete cycle:
+- **Consecutive Failure Detection**: If 3 consecutive actions fail, execution aborts with `StopReason::MetacognitiveAbort`.
+- **Sliding-Window Loop Detection**: Action fingerprints (`action_name:target_goal`) are tracked across a sliding window of size 6. If repeated identical actions are attempted, execution halts immediately with `StopReason::MetacognitiveAbort`.
+- **Failure Isolation**: Subproblem failures cleanly mark downstream dependencies as `Blocked` while allowing the overall investigation to complete via failure-tolerant `SynthesizeFindings`.

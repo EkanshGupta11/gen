@@ -2,24 +2,29 @@ pub mod actions;
 pub mod attention;
 pub mod events;
 pub mod executive;
+pub mod executor;
 pub mod goals;
 pub mod policy;
+pub mod runtime;
 pub mod state;
 pub mod working_memory;
 
-pub use actions::{ActionResult, ExecutiveAction, StopReason, SubgoalDef};
+pub use actions::{ActionExecutionStatus, ActionResult, ExecutiveAction, StopReason, SubgoalDef};
 pub use attention::{AttentionDecisionRecord, AttentionEngine, CandidateGoalScore};
 pub use events::{CognitiveEvent, CognitiveEventType};
 pub use executive::{
     ExecutiveConfig, ExecutiveController, MetacognitiveEvaluation, MetacognitiveRecommendation,
 };
+pub use executor::AsyncActionExecutor;
 pub use goals::{
     AgendaItem, AgendaStatus, CompletionCriterion, Goal, GoalManager, GoalStatus, Precondition,
 };
-pub use policy::{LoopDetector, validate_action_preconditions};
+pub use policy::{ALLOWED_SCIENTIFIC_TOOLS, LoopDetector, validate_action_preconditions};
+pub use runtime::CognitiveRuntime;
 pub use state::{
-    COGNITIVE_STATE_SCHEMA_VERSION, CognitiveState, ContradictionRecord, ExecutiveControllerState,
-    ExecutivePhase, Hypothesis, InvestigationContext, KnowledgeItem, Provenance,
+    COGNITIVE_STATE_SCHEMA_VERSION, CognitiveState, ContradictionRecord, ContradictionResolution,
+    ExecutiveControllerState, ExecutivePhase, Hypothesis, InvestigationContext, KnowledgeItem,
+    Provenance, ResolutionOutcome,
 };
 pub use working_memory::{
     DEFAULT_WORKING_MEMORY_CAPACITY, KnowledgeItemType, WorkingMemory, WorkingMemoryItem,
@@ -392,6 +397,164 @@ mod tests {
         assert_eq!(
             eval.recommendation,
             MetacognitiveRecommendation::ResolveContradiction
+        );
+    }
+
+    #[test]
+    fn test_unimplemented_and_unsupported_actions_do_not_report_success() {
+        let mut controller = ExecutiveController::new(
+            "inv-unsupported",
+            "Test unsupported actions",
+            ExecutiveConfig::default(),
+        );
+
+        // Action not implemented in synchronous runner
+        let action = ExecutiveAction::RetrieveKnowledge {
+            query: "quantum electrodynamics".into(),
+            domain: "physics".into(),
+        };
+
+        // When executed, must return Unsupported status with success == false
+        let outcome = controller.execute_action(&action);
+        assert!(!outcome.success);
+        assert_eq!(outcome.status, ActionExecutionStatus::Unsupported);
+        assert!(outcome.error.is_some());
+    }
+
+    #[test]
+    fn test_verification_cannot_be_bypassed_without_independent_checker() {
+        let mut controller = ExecutiveController::new(
+            "inv-verify-bypass",
+            "Verify calculation integrity",
+            ExecutiveConfig::default(),
+        );
+
+        // Add a goal and an uncertain calculation knowledge item with corrupt output
+        let goal_id = "calc-goal".to_string();
+        let k_item = KnowledgeItem {
+            id: "calc-corrupt".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"speed": 20.0, "angle_degrees": 35.0},
+                "output": {"range_m": 9999.0} // Corrupted!
+            }),
+            provenance: Provenance::new("scientific_tool").with_source_id("projectile"),
+            epistemic_status: EpistemicStatus::Uncertain,
+            related_goals: vec![goal_id.clone()],
+            related_entities: vec![],
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        };
+        controller.state.add_knowledge_item(k_item);
+
+        let verify_action = ExecutiveAction::VerifyCalculation {
+            tool_id: "calc-corrupt".into(),
+            goal_id: goal_id.clone(),
+        };
+
+        let outcome = controller.execute_action(&verify_action);
+        assert!(
+            !outcome.success,
+            "Corrupted calculation must NOT succeed verification"
+        );
+        assert_eq!(outcome.status, ActionExecutionStatus::Contradicted);
+
+        // Epistemic status in state must be Contradicted, NEVER Verified!
+        let updated_item = controller
+            .state
+            .knowledge_items
+            .get("calc-corrupt")
+            .unwrap();
+        assert_eq!(updated_item.epistemic_status, EpistemicStatus::Contradicted);
+        assert_eq!(controller.state.unresolved_contradictions().len(), 1);
+    }
+
+    #[test]
+    fn test_contradiction_resolution_requires_defensible_verified_evidence() {
+        let mut controller = ExecutiveController::new(
+            "inv-contra-resolve",
+            "Test evidence-based contradiction resolution",
+            ExecutiveConfig::default(),
+        );
+
+        // Case 1: Contradiction with NO verified evidence cannot be resolved automatically
+        controller.state.record_contradiction(
+            "contra-unverified",
+            "Uncertain claim conflict",
+            vec!["item-a".into(), "item-b".into()],
+        );
+
+        let resolve_action = ExecutiveAction::ResolveContradiction {
+            contradiction_id: "contra-unverified".into(),
+            resolution_strategy: "deterministic_verification_arbitration".into(),
+        };
+
+        let outcome1 = controller.execute_action(&resolve_action);
+        assert!(!outcome1.success);
+        assert_eq!(outcome1.status, ActionExecutionStatus::Uncertain);
+        assert!(!controller.state.contradictions[0].resolved);
+        assert_eq!(
+            controller.state.contradictions[0]
+                .resolution
+                .as_ref()
+                .unwrap()
+                .outcome,
+            ResolutionOutcome::RequiresHumanReview
+        );
+
+        // Case 2: Add verified evidence for item-a and contradicted for item-b
+        let k_item_a = KnowledgeItem {
+            id: "item-a".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({"tool": "projectile", "result": 38.33}),
+            provenance: Provenance::new("scientific_tool"),
+            epistemic_status: EpistemicStatus::Verified,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        };
+        let k_item_b = KnowledgeItem {
+            id: "item-b".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({"tool": "projectile", "result": 999.0}),
+            provenance: Provenance::new("model_claim"),
+            epistemic_status: EpistemicStatus::Contradicted,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        };
+        controller.state.add_knowledge_item(k_item_a);
+        controller.state.add_knowledge_item(k_item_b);
+
+        let outcome2 = controller.execute_action(&resolve_action);
+        assert!(outcome2.success);
+        assert_eq!(outcome2.status, ActionExecutionStatus::Succeeded);
+        assert!(controller.state.contradictions[0].resolved);
+        assert_eq!(
+            controller.state.contradictions[0]
+                .resolution
+                .as_ref()
+                .unwrap()
+                .outcome,
+            ResolutionOutcome::Resolved
+        );
+    }
+
+    #[test]
+    fn test_budget_and_loop_history_preserved_across_from_existing_state() {
+        let mut state = CognitiveState::new("inv-budget", "Test budget preservation", 16, 50);
+        state.executive.total_actions_executed = 15;
+        state.executive.remaining_action_budget = 35;
+        state.executive.loop_detection_history =
+            vec!["execute_scientific_tool:Some(\"goal-1\")".into()];
+
+        let controller =
+            ExecutiveController::from_existing_state(state, ExecutiveConfig::default());
+        assert_eq!(controller.total_actions_executed, 15);
+        assert_eq!(controller.state.executive.remaining_action_budget, 35);
+        assert_eq!(
+            controller.state.executive.loop_detection_history,
+            vec!["execute_scientific_tool:Some(\"goal-1\")"]
         );
     }
 }

@@ -8,12 +8,15 @@ use serde_json::{Value, json};
 
 use crate::{
     cognition::{
-        actions::{ActionResult, ExecutiveAction, StopReason},
+        actions::{ActionExecutionStatus, ActionResult, ExecutiveAction, StopReason},
         attention::AttentionEngine,
         events::{CognitiveEvent, CognitiveEventType},
         goals::{CompletionCriterion, Goal, GoalStatus},
         policy::{LoopDetector, validate_action_preconditions},
-        state::{CognitiveState, ExecutivePhase, KnowledgeItem, Provenance},
+        state::{
+            CognitiveState, ContradictionResolution, ExecutivePhase, KnowledgeItem, Provenance,
+            ResolutionOutcome,
+        },
         working_memory::KnowledgeItemType,
     },
     contracts::EpistemicStatus,
@@ -70,7 +73,7 @@ pub struct ExecutiveController {
     attention_engine: AttentionEngine,
     loop_detector: LoopDetector,
     start_time: Instant,
-    total_actions_executed: u32,
+    pub total_actions_executed: u32,
 }
 
 impl ExecutiveController {
@@ -97,14 +100,17 @@ impl ExecutiveController {
     }
 
     pub fn from_existing_state(state: CognitiveState, config: ExecutiveConfig) -> Self {
+        let total_actions_executed = state.executive.total_actions_executed;
+        let loop_detector =
+            LoopDetector::from_history(state.executive.loop_detection_history.clone(), 6);
         Self {
             state,
             config,
             events: Vec::new(),
             attention_engine: AttentionEngine::new(),
-            loop_detector: LoopDetector::default(),
+            loop_detector,
             start_time: Instant::now(),
-            total_actions_executed: 0,
+            total_actions_executed,
         }
     }
 
@@ -126,13 +132,12 @@ impl ExecutiveController {
         Ok(&self.state)
     }
 
-    /// Execute a single discrete cognitive control cycle:
-    /// OBSERVE -> UPDATE STATE -> EVALUATE GOALS -> ATTENTION -> SELECT ACTION
-    /// -> VALIDATE PRECONDITIONS -> EXECUTE ACTION -> EVALUATE OUTCOME
-    /// -> UPDATE WORKING MEMORY -> METACOGNITIVE MONITOR -> CONTINUE OR STOP
-    pub fn step(&mut self) -> Result<bool, String> {
+    /// Prepare next action step:
+    /// Check bounds -> Observe -> EvaluateGoals -> UpdateState -> Attention -> SelectAction
+    /// -> ValidatePreconditions -> Return action to execute.
+    pub fn step_prepare(&mut self) -> Result<Option<ExecutiveAction>, String> {
         if self.state.is_stopped() {
-            return Ok(false);
+            return Ok(None);
         }
 
         self.state.executive.current_cycle += 1;
@@ -150,15 +155,15 @@ impl ExecutiveController {
         // 1. Check bounds and timeouts
         if cycle > self.config.max_cycles {
             self.stop(StopReason::CycleLimitReached);
-            return Ok(false);
+            return Ok(None);
         }
         if self.total_actions_executed >= self.config.max_actions {
             self.stop(StopReason::BudgetExhausted);
-            return Ok(false);
+            return Ok(None);
         }
         if self.start_time.elapsed() >= self.config.timeout {
             self.stop(StopReason::TimeoutExceeded);
-            return Ok(false);
+            return Ok(None);
         }
 
         // 2. OBSERVE
@@ -181,10 +186,10 @@ impl ExecutiveController {
 
         if all_goals_complete {
             self.stop(StopReason::AllGoalsCompleted);
-            return Ok(false);
+            return Ok(None);
         }
 
-        // 4. ATTENTION AND PRIORITISATION
+        // 5. ATTENTION AND PRIORITISATION
         self.state.executive.current_phase = ExecutivePhase::AttentionPrioritisation;
         let attention_decision = self.attention_engine.select_focus(
             &self.state.goals,
@@ -202,7 +207,7 @@ impl ExecutiveController {
             }),
         );
 
-        // 5. SELECT NEXT ACTION
+        // 6. SELECT NEXT ACTION
         self.state.executive.current_phase = ExecutivePhase::SelectAction;
         let next_action = self.select_next_action(&attention_decision);
 
@@ -211,7 +216,7 @@ impl ExecutiveController {
             None => {
                 // If there are uncompleted goals but no eligible action can be selected, deadlock detected!
                 self.stop(StopReason::DeadlockNoExecutableActions);
-                return Ok(false);
+                return Ok(None);
             }
         };
 
@@ -224,7 +229,7 @@ impl ExecutiveController {
                 ),
             };
             self.stop(reason);
-            return Ok(false);
+            return Ok(None);
         }
 
         self.state.executive.selected_action = Some(action.clone());
@@ -236,7 +241,7 @@ impl ExecutiveController {
             }),
         );
 
-        // 6. VALIDATE PRECONDITIONS
+        // 7. VALIDATE PRECONDITIONS
         self.state.executive.current_phase = ExecutivePhase::ValidatePreconditions;
         match validate_action_preconditions(&action, &self.state) {
             Ok(()) => {
@@ -244,6 +249,7 @@ impl ExecutiveController {
                     CognitiveEventType::ActionPreconditionValidated,
                     json!({"action": action.name()}),
                 );
+                Ok(Some(action))
             }
             Err(precond_err) => {
                 self.emit_event(
@@ -251,34 +257,59 @@ impl ExecutiveController {
                     json!({"action": action.name(), "error": precond_err}),
                 );
                 // Action precondition failed: record failure and proceed
-                let outcome = ActionResult {
-                    action_id: uuid::Uuid::new_v4().to_string(),
-                    action_name: action.name().into(),
-                    success: false,
-                    output: Value::Null,
-                    error: Some(format!("Precondition failed: {precond_err}")),
-                    duration_ms: 0,
-                };
-                self.record_outcome(outcome);
-                return Ok(true);
+                let outcome = ActionResult::failed(
+                    uuid::Uuid::new_v4().to_string(),
+                    action.name(),
+                    format!("Precondition failed: {precond_err}"),
+                    0,
+                );
+                self.step_commit(&action, outcome)?;
+                Ok(None)
             }
         }
+    }
 
-        // 7. EXECUTE ACTION
-        self.state.executive.current_phase = ExecutivePhase::ExecuteAction;
-        let outcome = self.execute_action(&action);
+    /// Commit the outcome of an executed action:
+    /// EvaluateOutcome -> UpdateWorkingMemory -> MetacognitiveEvaluation -> ContinueOrStop.
+    pub fn step_commit(
+        &mut self,
+        action: &ExecutiveAction,
+        outcome: ActionResult,
+    ) -> Result<bool, String> {
+        let _ = action;
         self.total_actions_executed += 1;
+        self.state.executive.total_actions_executed = self.total_actions_executed;
         if self.state.executive.remaining_action_budget > 0 {
             self.state.executive.remaining_action_budget -= 1;
         }
+        self.state.executive.loop_detection_history = self.loop_detector.history();
 
         // 8. EVALUATE OUTCOME
         self.state.executive.current_phase = ExecutivePhase::EvaluateOutcome;
         self.record_outcome(outcome);
 
+        // Update agenda item status for completed action
+        for item in &mut self.state.goals.agenda {
+            if &item.action == action
+                && (item.status == crate::cognition::goals::AgendaStatus::Ready
+                    || item.status == crate::cognition::goals::AgendaStatus::Active)
+            {
+                item.status = if self.state.consecutive_failures == 0 {
+                    crate::cognition::goals::AgendaStatus::Completed
+                } else {
+                    crate::cognition::goals::AgendaStatus::Failed
+                };
+                break;
+            }
+        }
+
         // 9. UPDATE WORKING MEMORY
         self.state.executive.current_phase = ExecutivePhase::UpdateWorkingMemory;
         self.state.working_memory.deactivate_stale(0.05);
+
+        // Immediately evaluate completions and sync dependencies so state reflects action outcome
+        self.evaluate_goal_completions();
+        self.state.goals.evaluate_dependencies();
 
         // 10. METACOGNITIVE MONITORING
         self.state.executive.current_phase = ExecutivePhase::MetacognitiveEvaluation;
@@ -307,6 +338,22 @@ impl ExecutiveController {
         }
 
         Ok(!self.state.is_stopped())
+    }
+
+    /// Execute a single discrete cognitive control cycle synchronously:
+    pub fn step(&mut self) -> Result<bool, String> {
+        if self.state.is_stopped() {
+            return Ok(false);
+        }
+
+        match self.step_prepare()? {
+            Some(action) => {
+                self.state.executive.current_phase = ExecutivePhase::ExecuteAction;
+                let outcome = self.execute_action(&action);
+                self.step_commit(&action, outcome)
+            }
+            None => Ok(!self.state.is_stopped()),
+        }
     }
 
     fn select_next_action(
@@ -338,6 +385,7 @@ impl ExecutiveController {
         // Priority 4: Action synthesis for the focused goal based on its completion criteria
         if let Some(ref goal_id) = attention.selected_goal_id
             && let Some(goal) = self.state.goals.get_goal(goal_id)
+            && goal.status == GoalStatus::Active
         {
             for crit in &goal.completion_criteria {
                 match crit {
@@ -368,7 +416,9 @@ impl ExecutiveController {
                             .get_active_items(0.0)
                             .iter()
                             .any(|it| {
-                                it.id == *subject_id
+                                (it.id == *subject_id
+                                    || it.content.get("tool").and_then(Value::as_str)
+                                        == Some(subject_id))
                                     && it.epistemic_status == EpistemicStatus::Verified
                             });
                         if !already_verified {
@@ -386,7 +436,7 @@ impl ExecutiveController {
         None
     }
 
-    fn execute_action(&mut self, action: &ExecutiveAction) -> ActionResult {
+    pub fn execute_action(&mut self, action: &ExecutiveAction) -> ActionResult {
         let start = Instant::now();
         let action_id = uuid::Uuid::new_v4().to_string();
 
@@ -396,40 +446,68 @@ impl ExecutiveController {
                 arguments,
                 goal_id,
             } => {
-                // Deterministic local execution and Rust independent verification
                 let mut exec_args = arguments.clone();
-                // Default projectile args for projectile tests if not set
-                if tool == "projectile"
-                    && exec_args.as_object().map(|o| o.is_empty()).unwrap_or(true)
-                {
-                    exec_args = json!({"speed": 20.0, "angle_degrees": 35.0});
-                } else if tool == "arithmetic"
-                    && exec_args.as_object().map(|o| o.is_empty()).unwrap_or(true)
-                {
-                    exec_args = json!({"a": 10.0, "b": 20.0, "op": "add"});
+                let mut computed_val = json!({});
+
+                if tool == "projectile" {
+                    if exec_args.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                        exec_args = json!({"speed": 20.0, "angle_degrees": 35.0});
+                    }
+                    let speed = exec_args
+                        .get("speed")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(20.0);
+                    let angle_deg = exec_args
+                        .get("angle_degrees")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(35.0);
+                    let angle_rad = angle_deg.to_radians();
+                    let g = 9.80665;
+                    let range = (speed * speed * (2.0 * angle_rad).sin()) / g;
+                    let flight_time = (2.0 * speed * angle_rad.sin()) / g;
+                    let max_height = (speed * speed * angle_rad.sin().powi(2)) / (2.0 * g);
+                    computed_val = json!({
+                        "range_m": range,
+                        "flight_time_s": flight_time,
+                        "max_height_m": max_height
+                    });
+                } else if tool == "arithmetic" {
+                    if exec_args.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                        exec_args = json!({"a": 10.0, "b": 20.0, "op": "add"});
+                    }
+                    let a = exec_args.get("a").and_then(Value::as_f64).unwrap_or(0.0);
+                    let b = exec_args.get("b").and_then(Value::as_f64).unwrap_or(0.0);
+                    let op = exec_args.get("op").and_then(Value::as_str).unwrap_or("add");
+                    let val = match op {
+                        "add" => a + b,
+                        "sub" => a - b,
+                        "multiply" | "mul" => a * b,
+                        "div" if b != 0.0 => a / b,
+                        _ => a + b,
+                    };
+                    computed_val = json!({"value": val});
                 }
 
-                // Call independent Rust checker
-                let (v_res, status) = verification::verify_tool(
-                    tool,
-                    &exec_args,
-                    &Ok(json!({"executed_locally": true})),
-                );
+                // Call independent Rust checker with actual computed numbers
+                let (v_res, status) =
+                    verification::verify_tool(tool, &exec_args, &Ok(computed_val.clone()));
 
                 let output = json!({
                     "tool": tool,
                     "arguments": exec_args,
+                    "output": computed_val,
                     "verification": v_res,
                     "status": status.as_str()
                 });
 
                 // Add knowledge item
+                let k_item_id = format!("calc-{}", uuid::Uuid::new_v4());
                 let k_item = KnowledgeItem {
-                    id: format!("calc-{}", uuid::Uuid::new_v4()),
+                    id: k_item_id.clone(),
                     item_type: KnowledgeItemType::Calculation,
                     content: output.clone(),
                     provenance: Provenance::new("scientific_tool").with_source_id(tool),
-                    epistemic_status: status,
+                    epistemic_status: status.clone(),
                     related_goals: vec![goal_id.clone()],
                     related_entities: vec![],
                     timestamp: time::OffsetDateTime::now_utc()
@@ -438,30 +516,120 @@ impl ExecutiveController {
                 };
                 self.state.add_knowledge_item(k_item);
 
-                ActionResult {
-                    action_id,
-                    action_name: action.name().into(),
-                    success: true,
-                    output,
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
+                if status == EpistemicStatus::Contradicted {
+                    self.state.record_contradiction(
+                        format!("contra-{}", uuid::Uuid::new_v4()),
+                        format!("Tool '{tool}' contradicted independent verification"),
+                        vec![k_item_id],
+                    );
+                    ActionResult::contradicted(
+                        action_id,
+                        action.name(),
+                        output,
+                        "Calculation contradicted independent verification",
+                        start.elapsed().as_millis() as u64,
+                    )
+                } else {
+                    ActionResult::succeeded(
+                        action_id,
+                        action.name(),
+                        output,
+                        start.elapsed().as_millis() as u64,
+                    )
                 }
             }
             ExecutiveAction::VerifyCalculation { tool_id, goal_id } => {
-                // Mark item verified in working memory and goals
-                if let Some(item) = self.state.working_memory.get(tool_id) {
-                    let mut updated = item.clone();
-                    updated.epistemic_status = EpistemicStatus::Verified;
-                    let _ = self.state.working_memory.insert(updated);
+                let duration_ms = start.elapsed().as_millis() as u64;
+
+                let item_opt = self
+                    .state
+                    .knowledge_items
+                    .get(tool_id)
+                    .or_else(|| {
+                        self.state.knowledge_items.values().find(|k| {
+                            k.content.get("tool").and_then(Value::as_str) == Some(tool_id)
+                        })
+                    })
+                    .cloned();
+
+                let item = match item_opt {
+                    Some(it) => it,
+                    None => {
+                        return ActionResult::failed(
+                            action_id,
+                            action.name(),
+                            format!("Calculation '{tool_id}' not found in state"),
+                            duration_ms,
+                        );
+                    }
+                };
+
+                let tool_name = item
+                    .content
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments = item
+                    .content
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let worker_output = item.content.get("output").cloned();
+
+                let worker_res = match worker_output {
+                    Some(ref val) if !val.is_null() && val.get("error").is_none() => {
+                        Ok(val.clone())
+                    }
+                    Some(val) => Err(val
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Worker output error")
+                        .to_string()),
+                    None => Err("No output recorded".to_string()),
+                };
+
+                let (v_res, epistemic_status) =
+                    verification::verify_tool(&tool_name, &arguments, &worker_res);
+
+                if let Some(k_item) = self.state.knowledge_items.get_mut(&item.id) {
+                    k_item.epistemic_status = epistemic_status.clone();
+                }
+                if let Some(wm_item) = self.state.working_memory.get_mut(&item.id) {
+                    wm_item.epistemic_status = epistemic_status.clone();
                 }
 
-                ActionResult {
-                    action_id,
-                    action_name: action.name().into(),
-                    success: true,
-                    output: json!({"verified_tool_id": tool_id, "goal_id": goal_id}),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
+                let output = json!({
+                    "verified_tool_id": item.id,
+                    "goal_id": goal_id,
+                    "verification": v_res,
+                    "epistemic_status": epistemic_status.as_str()
+                });
+
+                if epistemic_status == EpistemicStatus::Contradicted {
+                    self.state.record_contradiction(
+                        format!("contra-{}", uuid::Uuid::new_v4()),
+                        format!("Tool '{}' contradicted verification", item.id),
+                        vec![item.id.clone()],
+                    );
+                    ActionResult::contradicted(
+                        action_id,
+                        action.name(),
+                        output,
+                        "Calculation contradicted independent verification",
+                        duration_ms,
+                    )
+                } else if epistemic_status == EpistemicStatus::Verified {
+                    ActionResult::succeeded(action_id, action.name(), output, duration_ms)
+                } else {
+                    ActionResult::new(
+                        action_id,
+                        action.name(),
+                        ActionExecutionStatus::Uncertain,
+                        output,
+                        Some("Independent verification failed or checker unavailable".into()),
+                        duration_ms,
+                    )
                 }
             }
             ExecutiveAction::DecomposeGoal {
@@ -488,67 +656,150 @@ impl ExecutiveController {
                     let _ = self.state.goals.add_goal(goal);
                 }
 
-                ActionResult {
+                ActionResult::succeeded(
                     action_id,
-                    action_name: action.name().into(),
-                    success: true,
-                    output: json!({"subgoals_created": subgoals.len()}),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                }
+                    action.name(),
+                    json!({"subgoals_created": subgoals.len()}),
+                    start.elapsed().as_millis() as u64,
+                )
             }
             ExecutiveAction::ResolveContradiction {
                 contradiction_id,
                 resolution_strategy,
             } => {
-                if let Some(c) = self
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let c_opt = self
                     .state
                     .contradictions
-                    .iter_mut()
-                    .find(|c| &c.id == contradiction_id)
-                {
-                    c.resolved = true;
-                    c.resolution = Some(format!("Resolved via {resolution_strategy}"));
+                    .iter()
+                    .position(|c| &c.id == contradiction_id);
+
+                let idx = match c_opt {
+                    Some(i) => i,
+                    None => {
+                        return ActionResult::failed(
+                            action_id,
+                            action.name(),
+                            format!("Contradiction '{contradiction_id}' not found"),
+                            duration_ms,
+                        );
+                    }
+                };
+
+                let conflicting_ids = self.state.contradictions[idx].conflicting_items.clone();
+                let mut verified_evidence = Vec::new();
+                let mut contradicted_items = Vec::new();
+
+                for item_id in &conflicting_ids {
+                    if let Some(item) = self.state.knowledge_items.get(item_id) {
+                        if item.epistemic_status == EpistemicStatus::Verified {
+                            verified_evidence.push(item_id.clone());
+                        } else if item.epistemic_status == EpistemicStatus::Contradicted {
+                            contradicted_items.push(item_id.clone());
+                        }
+                    }
                 }
-                ActionResult {
-                    action_id,
-                    action_name: action.name().into(),
-                    success: true,
-                    output: json!({"resolved": contradiction_id}),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
+
+                let now = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+
+                if !verified_evidence.is_empty() {
+                    let res = ContradictionResolution {
+                        contradiction_id: contradiction_id.clone(),
+                        conflicting_items: conflicting_ids,
+                        proposed_resolution: format!(
+                            "Resolved via {resolution_strategy}: verified evidence {:?} upheld, contradicted {:?} rejected",
+                            verified_evidence, contradicted_items
+                        ),
+                        supporting_evidence_refs: verified_evidence,
+                        verification_method: "rust_independent_verification".into(),
+                        outcome: ResolutionOutcome::Resolved,
+                        timestamp: now,
+                    };
+                    self.state.contradictions[idx].resolved = true;
+                    self.state.contradictions[idx].resolution = Some(res.clone());
+
+                    ActionResult::succeeded(
+                        action_id,
+                        action.name(),
+                        serde_json::to_value(&res).unwrap_or_default(),
+                        duration_ms,
+                    )
+                } else {
+                    let res = ContradictionResolution {
+                        contradiction_id: contradiction_id.clone(),
+                        conflicting_items: conflicting_ids,
+                        proposed_resolution: format!(
+                            "Cannot resolve contradiction via {resolution_strategy} without verified evidence. Requires human review."
+                        ),
+                        supporting_evidence_refs: vec![],
+                        verification_method: "none".into(),
+                        outcome: ResolutionOutcome::RequiresHumanReview,
+                        timestamp: now,
+                    };
+                    self.state.contradictions[idx].resolved = false;
+                    self.state.contradictions[idx].resolution = Some(res.clone());
+
+                    ActionResult::new(
+                        action_id,
+                        action.name(),
+                        ActionExecutionStatus::Uncertain,
+                        serde_json::to_value(&res).unwrap_or_default(),
+                        Some("Cannot resolve contradiction without verified evidence".into()),
+                        duration_ms,
+                    )
                 }
             }
             ExecutiveAction::UpdateCognitiveState { update_summary } => {
                 self.state.context.current_stage = update_summary.clone();
-                ActionResult {
+                ActionResult::succeeded(
                     action_id,
-                    action_name: action.name().into(),
-                    success: true,
-                    output: json!({"new_stage": update_summary}),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                }
+                    action.name(),
+                    json!({"new_stage": update_summary}),
+                    start.elapsed().as_millis() as u64,
+                )
             }
             ExecutiveAction::StopInvestigation { reason } => {
                 self.stop(reason.clone());
-                ActionResult {
+                ActionResult::succeeded(
                     action_id,
-                    action_name: action.name().into(),
-                    success: true,
-                    output: json!({"stop_reason": reason.as_str()}),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                }
+                    action.name(),
+                    json!({"stop_reason": reason.as_str()}),
+                    start.elapsed().as_millis() as u64,
+                )
             }
-            _ => ActionResult {
-                action_id,
-                action_name: action.name().into(),
-                success: true,
-                output: json!({"status": "completed"}),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            },
+            ExecutiveAction::CompareHypotheses { hypothesis_ids } => {
+                let mut comparisons = Vec::new();
+                for hid in hypothesis_ids {
+                    if let Some(h) = self.state.hypotheses.get(hid) {
+                        comparisons.push(json!({
+                            "id": h.id,
+                            "statement": h.statement,
+                            "supporting_count": h.supporting_observations.len(),
+                            "contradicting_count": h.contradicting_observations.len(),
+                        }));
+                    }
+                }
+                ActionResult::succeeded(
+                    action_id,
+                    action.name(),
+                    json!({"comparisons": comparisons}),
+                    start.elapsed().as_millis() as u64,
+                )
+            }
+            unimplemented => {
+                // Critical Defect E fix: An unimplemented action must NEVER report success!
+                ActionResult::unsupported(
+                    action_id,
+                    unimplemented.name(),
+                    format!(
+                        "Action '{}' is not implemented in synchronous executor",
+                        unimplemented.name()
+                    ),
+                    start.elapsed().as_millis() as u64,
+                )
+            }
         }
     }
 
@@ -563,6 +814,7 @@ impl ExecutiveController {
             CognitiveEventType::ActionExecuted,
             json!({
                 "action": outcome.action_name,
+                "status": outcome.status.as_str(),
                 "success": outcome.success,
                 "error": outcome.error,
                 "duration_ms": outcome.duration_ms
@@ -596,18 +848,49 @@ impl ExecutiveController {
                 .goals
                 .verify_and_complete_goal(&goal_id, |crit| match crit {
                     CompletionCriterion::ToolExecuted { tool_name } => {
-                        wm.get_active_items(0.0).iter().any(|it| {
-                            it.item_type == KnowledgeItemType::Calculation
+                        self.state.knowledge_items.values().any(|k| {
+                            (k.related_goals.contains(&goal_id) || k.related_goals.is_empty())
+                                && k.item_type == KnowledgeItemType::Calculation
+                                && (k.content.get("tool").and_then(Value::as_str)
+                                    == Some(tool_name)
+                                    || k.provenance.source_id.as_deref() == Some(tool_name))
+                        }) || wm.get_active_items(0.0).iter().any(|it| {
+                            (it.related_goals.contains(&goal_id) || it.related_goals.is_empty())
+                                && it.item_type == KnowledgeItemType::Calculation
                                 && it.content.get("tool").and_then(Value::as_str) == Some(tool_name)
                         })
                     }
                     CompletionCriterion::CalculationVerified { subject_id } => {
-                        wm.get_active_items(0.0).iter().any(|it| {
-                            (it.id == *subject_id
-                                || it.content.get("tool").and_then(Value::as_str)
-                                    == Some(subject_id))
+                        self.state.knowledge_items.values().any(|k| {
+                            (k.related_goals.contains(&goal_id) || k.related_goals.is_empty())
+                                && k.item_type == KnowledgeItemType::Calculation
+                                && (k.id == *subject_id
+                                    || k.content.get("tool").and_then(Value::as_str)
+                                        == Some(subject_id)
+                                    || k.provenance.source_id.as_deref() == Some(subject_id))
+                                && k.epistemic_status == EpistemicStatus::Verified
+                        }) || wm.get_active_items(0.0).iter().any(|it| {
+                            (it.related_goals.contains(&goal_id) || it.related_goals.is_empty())
+                                && (it.id == *subject_id
+                                    || it.content.get("tool").and_then(Value::as_str)
+                                        == Some(subject_id))
                                 && it.epistemic_status == EpistemicStatus::Verified
                         })
+                    }
+                    CompletionCriterion::SpecialistReportReceived { specialist } => {
+                        self.state.knowledge_items.values().any(|k| {
+                            k.related_goals.contains(&goal_id)
+                                && (k.provenance.source_id.as_deref() == Some(specialist.as_str())
+                                    || k.content.get("specialist").and_then(Value::as_str)
+                                        == Some(specialist.as_str()))
+                        })
+                    }
+                    CompletionCriterion::SynthesisCompleted => {
+                        self.state
+                            .knowledge_items
+                            .values()
+                            .any(|k| k.provenance.source_type == "synthesis")
+                            || self.state.context.current_stage == "completed"
                     }
                     CompletionCriterion::SubGoalsCompleted => {
                         !child_statuses.is_empty()

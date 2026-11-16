@@ -46,7 +46,9 @@ pub enum Precondition {
 pub enum CompletionCriterion {
     ToolExecuted { tool_name: String },
     CalculationVerified { subject_id: String },
+    SpecialistReportReceived { specialist: String },
     SubGoalsCompleted,
+    SynthesisCompleted,
     ObservationsRecorded { min_count: usize },
     HypothesesTested,
     ExplicitApproval { requirement: String },
@@ -178,33 +180,70 @@ impl GoalManager {
     }
 
     pub fn evaluate_dependencies(&mut self) {
-        let snapshot = self.goals.clone();
-        for goal in self.goals.values_mut() {
-            if goal.status == GoalStatus::Pending || goal.status == GoalStatus::Blocked {
-                let any_dep_failed = goal.dependencies.iter().any(|dep_id| {
-                    snapshot
-                        .get(dep_id)
-                        .map(|d| {
-                            d.status == GoalStatus::Failed || d.status == GoalStatus::Cancelled
-                        })
-                        .unwrap_or(false)
-                });
-                if any_dep_failed {
-                    goal.status = GoalStatus::Blocked;
-                    continue;
-                }
+        let mut changed = true;
+        let mut iterations = 0;
+        while changed && iterations < 10 {
+            changed = false;
+            iterations += 1;
+            let snapshot = self.goals.clone();
+            for goal in self.goals.values_mut() {
+                if goal.status == GoalStatus::Pending || goal.status == GoalStatus::Blocked {
+                    let is_synthesis = goal
+                        .completion_criteria
+                        .iter()
+                        .any(|c| matches!(c, CompletionCriterion::SynthesisCompleted));
 
-                let all_deps_completed = goal.dependencies.iter().all(|dep_id| {
-                    snapshot
-                        .get(dep_id)
-                        .map(|d| d.status == GoalStatus::Completed)
-                        .unwrap_or(false)
-                });
+                    if is_synthesis {
+                        let all_deps_finished = !goal.dependencies.is_empty()
+                            && goal.dependencies.iter().all(|dep_id| {
+                                snapshot
+                                    .get(dep_id)
+                                    .map(|d| {
+                                        d.status.is_terminal() || d.status == GoalStatus::Blocked
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        if all_deps_finished && goal.status != GoalStatus::Active {
+                            goal.status = GoalStatus::Active;
+                            changed = true;
+                        }
+                        // Synthesis never blocks due to a failed dependency: it isolates failures
+                        // and activates when all upstream subproblems have reached a terminal or blocked state.
+                        continue;
+                    }
 
-                if all_deps_completed {
-                    goal.status = GoalStatus::Active;
-                } else {
-                    goal.status = GoalStatus::Blocked;
+                    let any_dep_failed = goal.dependencies.iter().any(|dep_id| {
+                        snapshot
+                            .get(dep_id)
+                            .map(|d| {
+                                d.status == GoalStatus::Failed || d.status == GoalStatus::Cancelled
+                            })
+                            .unwrap_or(false)
+                    });
+                    if any_dep_failed {
+                        if goal.status != GoalStatus::Blocked {
+                            goal.status = GoalStatus::Blocked;
+                            changed = true;
+                        }
+                        continue;
+                    }
+
+                    let all_deps_completed = goal.dependencies.iter().all(|dep_id| {
+                        snapshot
+                            .get(dep_id)
+                            .map(|d| d.status == GoalStatus::Completed)
+                            .unwrap_or(false)
+                    });
+
+                    if all_deps_completed {
+                        if goal.status != GoalStatus::Active {
+                            goal.status = GoalStatus::Active;
+                            changed = true;
+                        }
+                    } else if goal.status != GoalStatus::Blocked {
+                        goal.status = GoalStatus::Blocked;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -221,6 +260,11 @@ impl GoalManager {
                     GoalStatus::Active => {
                         if item.status == AgendaStatus::Blocked {
                             item.status = AgendaStatus::Ready;
+                        }
+                    }
+                    GoalStatus::Completed => {
+                        if item.status != AgendaStatus::Completed {
+                            item.status = AgendaStatus::Completed;
                         }
                     }
                     GoalStatus::Blocked => {
@@ -275,7 +319,7 @@ impl GoalManager {
                     .unwrap_or_default(),
             );
             for item in &mut self.agenda {
-                if item.goal_id == id && item.status == AgendaStatus::Active {
+                if item.goal_id == id && item.status != AgendaStatus::Completed {
                     item.status = AgendaStatus::Completed;
                 }
             }
@@ -292,7 +336,14 @@ impl GoalManager {
     pub fn get_ready_agenda_items(&self) -> Vec<&AgendaItem> {
         self.agenda
             .iter()
-            .filter(|a| a.status == AgendaStatus::Ready)
+            .filter(|a| {
+                a.status == AgendaStatus::Ready
+                    && self
+                        .goals
+                        .get(&a.goal_id)
+                        .map(|g| g.status == GoalStatus::Active)
+                        .unwrap_or(false)
+            })
             .collect()
     }
 }
