@@ -274,6 +274,8 @@ pub struct Investigation {
     pub model: ModelMetadata,
     pub sources: Vec<Value>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cognitive_state: Option<crate::cognition::CognitiveState>,
 }
 
 #[derive(Debug, Deserialize)]

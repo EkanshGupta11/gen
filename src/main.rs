@@ -1,4 +1,5 @@
 mod api;
+pub mod cognition;
 mod contracts;
 mod orchestrator;
 mod provider;

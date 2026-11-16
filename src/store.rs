@@ -11,7 +11,7 @@ use tokio::task;
 
 use crate::contracts::{HistoryItem, Investigation};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -87,6 +87,165 @@ impl Store {
         .await
         .map_err(|error| StoreError::Task(error.to_string()))?
     }
+
+    #[allow(dead_code)]
+    pub async fn save_cognitive_state(
+        &self,
+        investigation_id: String,
+        state: &crate::cognition::CognitiveState,
+    ) -> Result<(), StoreError> {
+        let path = self.path.clone();
+        let state_json = serde_json::to_string(state).map_err(|_| StoreError::InvalidStoredJson)?;
+        task::spawn_blocking(move || {
+            let connection = open_connection(&path)?;
+            connection.execute(
+                "UPDATE investigations SET cognitive_state_json=?1 WHERE id=?2",
+                params![state_json, investigation_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| StoreError::Task(error.to_string()))?
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_cognitive_state(
+        &self,
+        investigation_id: String,
+    ) -> Result<Option<crate::cognition::CognitiveState>, StoreError> {
+        let path = self.path.clone();
+        task::spawn_blocking(move || {
+            let connection = open_connection(&path)?;
+            let raw: Option<String> = connection
+                .query_row(
+                    "SELECT cognitive_state_json FROM investigations WHERE id=?1",
+                    params![investigation_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match raw {
+                Some(json_str) => {
+                    let state = serde_json::from_str(&json_str)
+                        .map_err(|_| StoreError::InvalidStoredJson)?;
+                    Ok(Some(state))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|error| StoreError::Task(error.to_string()))?
+    }
+
+    #[allow(dead_code)]
+    pub async fn append_cognitive_events(
+        &self,
+        events: Vec<crate::cognition::CognitiveEvent>,
+    ) -> Result<(), StoreError> {
+        let path = self.path.clone();
+        task::spawn_blocking(move || {
+            let mut connection = open_connection(&path)?;
+            let tx = connection.transaction()?;
+            for ev in events {
+                let payload = serde_json::to_string(&ev.payload)
+                    .map_err(|_| StoreError::InvalidStoredJson)?;
+                tx.execute(
+                    "INSERT INTO cognitive_events (id, investigation_id, cycle, timestamp, event_type, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        ev.id,
+                        ev.investigation_id,
+                        ev.cycle,
+                        ev.timestamp,
+                        ev.event_type.as_str(),
+                        payload
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| StoreError::Task(error.to_string()))?
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_cognitive_events(
+        &self,
+        investigation_id: String,
+    ) -> Result<Vec<crate::cognition::CognitiveEvent>, StoreError> {
+        let path = self.path.clone();
+        task::spawn_blocking(move || {
+            let connection = open_connection(&path)?;
+            let mut stmt = connection.prepare(
+                "SELECT id, investigation_id, cycle, timestamp, event_type, payload_json
+                 FROM cognitive_events
+                 WHERE investigation_id=?1
+                 ORDER BY cycle ASC, timestamp ASC",
+            )?;
+            let rows = stmt.query_map(params![investigation_id], |row| {
+                let id: String = row.get(0)?;
+                let inv_id: String = row.get(1)?;
+                let cycle: u32 = row.get(2)?;
+                let timestamp: String = row.get(3)?;
+                let event_type_str: String = row.get(4)?;
+                let payload_str: String = row.get(5)?;
+                Ok((id, inv_id, cycle, timestamp, event_type_str, payload_str))
+            })?;
+
+            let mut events = Vec::new();
+            for r in rows {
+                let (id, inv_id, cycle, timestamp, event_type_str, payload_str) = r?;
+                let payload: Value = serde_json::from_str(&payload_str)
+                    .map_err(|_| StoreError::InvalidStoredJson)?;
+                let event_type = match event_type_str.as_str() {
+                    "cycle_started" => crate::cognition::CognitiveEventType::CycleStarted,
+                    "state_updated" => crate::cognition::CognitiveEventType::StateUpdated,
+                    "goal_created" => crate::cognition::CognitiveEventType::GoalCreated,
+                    "goal_status_changed" => {
+                        crate::cognition::CognitiveEventType::GoalStatusChanged
+                    }
+                    "memory_item_inserted" => {
+                        crate::cognition::CognitiveEventType::MemoryItemInserted
+                    }
+                    "memory_item_updated" => {
+                        crate::cognition::CognitiveEventType::MemoryItemUpdated
+                    }
+                    "memory_item_evicted" => {
+                        crate::cognition::CognitiveEventType::MemoryItemEvicted
+                    }
+                    "attention_focused" => crate::cognition::CognitiveEventType::AttentionFocused,
+                    "action_selected" => crate::cognition::CognitiveEventType::ActionSelected,
+                    "action_precondition_validated" => {
+                        crate::cognition::CognitiveEventType::ActionPreconditionValidated
+                    }
+                    "action_precondition_failed" => {
+                        crate::cognition::CognitiveEventType::ActionPreconditionFailed
+                    }
+                    "action_executed" => crate::cognition::CognitiveEventType::ActionExecuted,
+                    "action_evaluation" => crate::cognition::CognitiveEventType::ActionEvaluation,
+                    "metacognitive_evaluation" => {
+                        crate::cognition::CognitiveEventType::MetacognitiveEvaluation
+                    }
+                    "investigation_stopped" => {
+                        crate::cognition::CognitiveEventType::InvestigationStopped
+                    }
+                    _ => crate::cognition::CognitiveEventType::StateUpdated,
+                };
+                events.push(crate::cognition::CognitiveEvent {
+                    id,
+                    investigation_id: inv_id,
+                    cycle,
+                    timestamp,
+                    event_type,
+                    payload,
+                });
+            }
+            Ok(events)
+        })
+        .await
+        .map_err(|error| StoreError::Task(error.to_string()))?
+    }
 }
 
 fn open_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
@@ -114,7 +273,7 @@ fn create_migration_backup(connection: &Connection, path: &Path) -> Result<PathB
         } else {
             format!("-{index:03}")
         };
-        let destination = parent.join(format!("{stem}.pre-m1.2{suffix}.bak.sqlite3"));
+        let destination = parent.join(format!("{stem}.pre-m1.3{suffix}.bak.sqlite3"));
         if destination.exists() {
             index += 1;
             continue;
@@ -142,10 +301,20 @@ fn migrate(connection: &mut Connection, has_table: bool) -> Result<(), StoreErro
                 verification_json TEXT,
                 synthesis_json TEXT,
                 model_metadata_json TEXT,
-                error_json TEXT
+                error_json TEXT,
+                cognitive_state_json TEXT
             );
             CREATE INDEX investigations_created_at ON investigations(created_at DESC);
-            PRAGMA user_version=1;",
+            CREATE TABLE IF NOT EXISTS cognitive_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                investigation_id TEXT NOT NULL,
+                cycle INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cognitive_events_inv ON cognitive_events(investigation_id, cycle, timestamp);
+            PRAGMA user_version=2;",
         )?;
         return Ok(());
     }
@@ -195,6 +364,10 @@ fn migrate(connection: &mut Connection, has_table: bool) -> Result<(), StoreErro
             "error_json",
             "ALTER TABLE investigations ADD COLUMN error_json TEXT",
         ),
+        (
+            "cognitive_state_json",
+            "ALTER TABLE investigations ADD COLUMN cognitive_state_json TEXT",
+        ),
     ];
     for (column, statement) in migrations {
         if !existing
@@ -210,7 +383,16 @@ fn migrate(connection: &mut Connection, has_table: bool) -> Result<(), StoreErro
     )?;
     transaction.execute_batch(
         "CREATE INDEX IF NOT EXISTS investigations_created_at ON investigations(created_at DESC);
-         PRAGMA user_version=1;",
+         CREATE TABLE IF NOT EXISTS cognitive_events (
+             id TEXT PRIMARY KEY NOT NULL,
+             investigation_id TEXT NOT NULL,
+             cycle INTEGER NOT NULL,
+             timestamp TEXT NOT NULL,
+             event_type TEXT NOT NULL,
+             payload_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_cognitive_events_inv ON cognitive_events(investigation_id, cycle, timestamp);
+         PRAGMA user_version=2;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -236,10 +418,11 @@ fn save_sync(path: &Path, investigation: &Investigation) -> Result<(), StoreErro
     let model =
         serde_json::to_string(&investigation.model).map_err(|_| StoreError::InvalidStoredJson)?;
     let error = json_option(&investigation.error)?;
+    let cognitive_state = json_option(&investigation.cognitive_state)?;
     connection.execute(
-        "INSERT INTO investigations (id,question,created_at,result,updated_at,status,plan_json,specialist_reports_json,tool_results_json,verification_json,synthesis_json,model_metadata_json,error_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-         ON CONFLICT(id) DO UPDATE SET question=excluded.question, result=excluded.result, updated_at=excluded.updated_at, status=excluded.status, plan_json=excluded.plan_json, specialist_reports_json=excluded.specialist_reports_json, tool_results_json=excluded.tool_results_json, verification_json=excluded.verification_json, synthesis_json=excluded.synthesis_json, model_metadata_json=excluded.model_metadata_json, error_json=excluded.error_json",
+        "INSERT INTO investigations (id,question,created_at,result,updated_at,status,plan_json,specialist_reports_json,tool_results_json,verification_json,synthesis_json,model_metadata_json,error_json,cognitive_state_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+         ON CONFLICT(id) DO UPDATE SET question=excluded.question, result=excluded.result, updated_at=excluded.updated_at, status=excluded.status, plan_json=excluded.plan_json, specialist_reports_json=excluded.specialist_reports_json, tool_results_json=excluded.tool_results_json, verification_json=excluded.verification_json, synthesis_json=excluded.synthesis_json, model_metadata_json=excluded.model_metadata_json, error_json=excluded.error_json, cognitive_state_json=excluded.cognitive_state_json",
         params![
             investigation.id,
             investigation.question,
@@ -254,6 +437,7 @@ fn save_sync(path: &Path, investigation: &Investigation) -> Result<(), StoreErro
             synthesis,
             model,
             error,
+            cognitive_state,
         ],
     )?;
     Ok(())
@@ -335,6 +519,7 @@ mod tests {
             },
             sources: vec![],
             error: None,
+            cognitive_state: None,
         }
     }
 
@@ -404,5 +589,191 @@ mod tests {
         assert_eq!(history[0].result["specialist_reports"][0]["status"], "mock");
         assert!(reopened.delete("id-1".into()).await.unwrap());
         assert!(reopened.get("id-1".into()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cognitive_state_persistence_and_resumption_across_store_instances() {
+        use std::time::Duration;
+
+        use crate::cognition::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cognition_resume.sqlite3");
+
+        // 1. Creating cognitive state
+        let inv_id = "inv-resume-test".to_string();
+        let mut controller = ExecutiveController::new(
+            inv_id.clone(),
+            "Calculate and verify trajectory",
+            ExecutiveConfig {
+                max_cycles: 20,
+                max_actions: 20,
+                timeout: Duration::from_secs(10),
+                working_memory_capacity: 10,
+            },
+        );
+
+        // Add 2 sequential goals
+        let goal1 = Goal {
+            id: "step-1".into(),
+            description: "Execute projectile calculation".into(),
+            parent_goal: None,
+            priority: 90,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::ToolExecuted {
+                tool_name: "projectile".into(),
+            }],
+            created_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: None,
+        };
+        let goal2 = Goal {
+            id: "step-2".into(),
+            description: "Update summary after step 1".into(),
+            parent_goal: None,
+            priority: 80,
+            status: GoalStatus::Pending,
+            dependencies: vec!["step-1".into()],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SubGoalsCompleted],
+            created_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: None,
+        };
+        controller.state.goals.add_goal(goal1).unwrap();
+        controller.state.goals.add_goal(goal2).unwrap();
+
+        // Add an agenda action for step-2
+        controller.state.goals.add_agenda_item(AgendaItem {
+            id: "agenda-step-2".into(),
+            goal_id: "step-2".into(),
+            action: ExecutiveAction::UpdateCognitiveState {
+                update_summary: "trajectory_verified".into(),
+            },
+            status: AgendaStatus::Blocked,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+
+        // 2. Updating working memory & 3. Executing controller action (which completes goal 1)
+        let cont = controller.step().unwrap();
+        assert!(cont);
+        // Step again to evaluate completion criteria for step-1
+        let cont2 = controller.step().unwrap();
+        assert!(cont2);
+
+        assert_eq!(
+            controller.state.goals.get_goal("step-1").unwrap().status,
+            GoalStatus::Completed,
+            "Goal step-1 must be completed"
+        );
+        assert_eq!(
+            controller.state.goals.get_goal("step-2").unwrap().status,
+            GoalStatus::Active,
+            "Goal step-2 must now be Active because step-1 completed"
+        );
+        assert_eq!(
+            controller.state.working_memory.len(),
+            1,
+            "Working memory must contain the projectile calculation item"
+        );
+
+        // 4. Persisting state & events to SQLite store
+        let (store, _) = Store::initialize(&path).unwrap();
+        let sample_record = Investigation {
+            contract_version: "1.0".into(),
+            id: inv_id.clone(),
+            question: "Calculate and verify trajectory".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            status: crate::contracts::InvestigationStatus::Executing,
+            mode: "mock_offline".into(),
+            plan: None,
+            specialist_reports: vec![],
+            tools: vec![],
+            verification: vec![],
+            synthesis: None,
+            model: crate::contracts::ModelMetadata {
+                provider: "mock".into(),
+                model: None,
+                request_count: 0,
+                http_attempt_count: 0,
+                usage: None,
+            },
+            sources: vec![],
+            error: None,
+            cognitive_state: Some(controller.state.clone()),
+        };
+        store.save(&sample_record).await.unwrap();
+        store
+            .save_cognitive_state(inv_id.clone(), &controller.state)
+            .await
+            .unwrap();
+        store
+            .append_cognitive_events(controller.events.clone())
+            .await
+            .unwrap();
+
+        // 5. Stopping the application (dropping store and controller)
+        drop(controller);
+        drop(store);
+
+        // 6. Restarting it: open fresh store instance from disk
+        let (reopened_store, _) = Store::initialize(&path).unwrap();
+
+        // 7. Restoring the investigation's cognitive state
+        let restored_state = reopened_store
+            .get_cognitive_state(inv_id.clone())
+            .await
+            .unwrap()
+            .expect("Cognitive state must be recovered from SQLite");
+
+        assert_eq!(restored_state.context.investigation_id, inv_id);
+        assert_eq!(
+            restored_state.goals.get_goal("step-1").unwrap().status,
+            GoalStatus::Completed
+        );
+        assert_eq!(
+            restored_state.goals.get_goal("step-2").unwrap().status,
+            GoalStatus::Active
+        );
+        assert_eq!(restored_state.working_memory.len(), 1);
+
+        // Check that cognitive events were also restored
+        let restored_events = reopened_store
+            .get_cognitive_events(inv_id.clone())
+            .await
+            .unwrap();
+        assert!(!restored_events.is_empty());
+
+        // 8. Continuing with the next eligible action on resumed controller
+        let mut resumed_controller = ExecutiveController::from_existing_state(
+            restored_state,
+            ExecutiveConfig {
+                max_cycles: 10,
+                max_actions: 10,
+                timeout: Duration::from_secs(5),
+                working_memory_capacity: 10,
+            },
+        );
+
+        // Step the resumed controller: must execute step-2 action, NOT repeat step-1!
+        let resumed_cont = resumed_controller.step().unwrap();
+        assert!(resumed_cont);
+
+        let last_action = resumed_controller
+            .state
+            .executive
+            .selected_action
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            last_action.name(),
+            "update_cognitive_state",
+            "Resumed controller must continue with next eligible action without repeating completed step-1"
+        );
+        assert_eq!(
+            resumed_controller.state.context.current_stage,
+            "trajectory_verified"
+        );
     }
 }

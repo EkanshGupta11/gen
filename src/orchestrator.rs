@@ -71,7 +71,15 @@ impl Orchestrator {
             },
             sources: vec![],
             error: None,
+            cognitive_state: None,
         };
+        let initial_cognitive_state = crate::cognition::CognitiveState::new(
+            record.id.clone(),
+            question.clone(),
+            crate::cognition::DEFAULT_WORKING_MEMORY_CAPACITY,
+            50,
+        );
+        record.cognitive_state = Some(initial_cognitive_state);
         self.store.save(&record).await.map_err(|e| e.to_string())?;
 
         let budget = Arc::new(RequestBudget::new(
@@ -95,6 +103,37 @@ impl Orchestrator {
             record.plan = Some(plan.clone());
             record.status = InvestigationStatus::Executing;
             record.updated_at = timestamp();
+
+            if let Some(cs) = record.cognitive_state.as_mut() {
+                cs.context.primary_objective = plan.objective.clone();
+                cs.context.relevant_entities = plan.entities.clone();
+                cs.context.known_variables = plan.known_variables.clone();
+                cs.context.unknown_variables = plan.unknown_variables.clone();
+                cs.context.constraints = plan.constraints.clone();
+                cs.context.current_stage = "executing_subproblems".into();
+                for sub in &plan.subproblems {
+                    let goal = crate::cognition::Goal {
+                        id: sub.id.clone(),
+                        description: sub.task.clone(),
+                        parent_goal: None,
+                        priority: 50,
+                        status: if sub.depends_on.is_empty() {
+                            crate::cognition::GoalStatus::Active
+                        } else {
+                            crate::cognition::GoalStatus::Pending
+                        },
+                        dependencies: sub.depends_on.clone(),
+                        preconditions: Vec::new(),
+                        completion_criteria: vec![
+                            crate::cognition::CompletionCriterion::SubGoalsCompleted,
+                        ],
+                        created_at: timestamp(),
+                        completed_at: None,
+                    };
+                    let _ = cs.goals.add_goal(goal);
+                }
+            }
+
             self.store.save(&record).await.map_err(|e| e.to_string())?;
 
             // Task identity is defined by task IDs, not specialist names.
@@ -241,6 +280,33 @@ impl Orchestrator {
                                 .insert(task_res.subproblem_id.clone(), task_res.tools.clone());
                             task_reports
                                 .insert(task_res.subproblem_id.clone(), task_res.report.clone());
+                            if let Some(cs) = record.cognitive_state.as_mut() {
+                                if let Some(goal) = cs.goals.get_goal_mut(&task_res.subproblem_id)
+                                {
+                                    if task_res.report.status == AgentExecutionStatus::Failed {
+                                        goal.status = crate::cognition::GoalStatus::Failed;
+                                    } else {
+                                        goal.status = crate::cognition::GoalStatus::Completed;
+                                        goal.completed_at = Some(timestamp());
+                                    }
+                                }
+                                for tool in &task_res.tools {
+                                    let k_item = crate::cognition::KnowledgeItem {
+                                        id: tool.id.clone(),
+                                        item_type: crate::cognition::KnowledgeItemType::Calculation,
+                                        content: serde_json::to_value(tool).unwrap_or_default(),
+                                        provenance: crate::cognition::Provenance::new(
+                                            "specialist_tool",
+                                        )
+                                        .with_source_id(tool.specialist.as_str()),
+                                        epistemic_status: tool.epistemic_status.clone(),
+                                        related_goals: vec![task_res.subproblem_id.clone()],
+                                        related_entities: vec![],
+                                        timestamp: timestamp(),
+                                    };
+                                    cs.add_knowledge_item(k_item);
+                                }
+                            }
                             record.specialist_reports.push(task_res.report);
                             record.tools.extend(task_res.tools);
                             record.verification.extend(task_res.verifications);
@@ -316,6 +382,12 @@ impl Orchestrator {
             record.model.http_attempt_count = budget.http_attempt_count();
             record.model.usage = budget.usage();
 
+            if let Some(cs) = record.cognitive_state.as_mut() {
+                cs.context.current_stage = "completed".into();
+                cs.executive.current_phase = crate::cognition::ExecutivePhase::Stopped;
+                cs.executive.stop_reason = Some(crate::cognition::StopReason::ObjectiveAchieved);
+            }
+
             self.store.save(&record).await.map_err(|e| e.to_string())?;
             Ok(record.clone())
         }
@@ -329,6 +401,14 @@ impl Orchestrator {
                 record.updated_at = timestamp();
                 record.model.request_count = budget.model_call_count();
                 record.model.http_attempt_count = budget.http_attempt_count();
+                if let Some(cs) = record.cognitive_state.as_mut() {
+                    cs.context.current_stage = "failed".into();
+                    cs.executive.current_phase = crate::cognition::ExecutivePhase::Stopped;
+                    cs.executive.stop_reason =
+                        Some(crate::cognition::StopReason::MetacognitiveAbort {
+                            rationale: error.clone(),
+                        });
+                }
                 let _ = self.store.save(&record).await;
                 Err(error)
             }

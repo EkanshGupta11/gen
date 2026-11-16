@@ -1,6 +1,6 @@
 # NeuroGenesis AI
 
-An offline-capable scientific investigation workspace. Rust owns investigation planning, selected specialist requests, hosted-model communication, scientific-tool dispatch, independent verification coordination, and persistent investigation history. Python provides deterministic calculations. The browser displays saved plans, specialist outputs, calculations, epistemic status, and synthesis.
+An offline-capable scientific intelligence workspace. Rust owns investigation planning, internal cognitive control, selected specialist requests, hosted-model communication, scientific-tool dispatch, independent verification coordination, and persistent investigation history. Python provides deterministic calculations. The browser displays saved plans, specialist outputs, internal cognitive control state, working memory, calculations, epistemic status, and synthesis.
 
 ## Windows Quick Start
 
@@ -15,32 +15,39 @@ The mock provider exercises the workflow without credentials, explicitly labelin
 
 ## Current Capabilities
 
+- **Cognitive Control Foundation (Milestone 1.3):**
+  - *Bounded Working Memory Engine:* Configurable capacity (default: 64) with deterministic retention scoring, activation decay, retrieval reinforcement, and strict protection for pinned items and unresolved contradictions.
+  - *Hierarchical Goal & Agenda Management:* Directed goal trees with dependency resolution, preconditions, and strictly verified completion criteria. Tasks are never marked complete solely because an agent asserts it.
+  - *Selective Attention & Prioritisation:* Deterministic attention engine scoring goals on readiness, contradiction resolution, base priority, uncertainty, and missing information with deterministic tie-breaking.
+  - *10-Phase Executive Controller:* Discrete loop (`Observe -> UpdateState -> EvaluateGoals -> Attention -> SelectAction -> ValidatePreconditions -> ExecuteAction -> EvaluateOutcome -> UpdateWorkingMemory -> MetacognitiveEvaluation -> ContinueOrStop`). Features rolling loop detection, cycle/action budgets, and deadlock handling.
+  - *Metacognitive Monitoring:* Typed health evaluations evaluating progress, repeated failures, unverified calculations, and contradictions.
 - **Strict Epistemic Classification:** Rigorous separation of claims into six mutually exclusive statuses: `verified`, `calculated`, `evidence_supported`, `hypothesis`, `uncertain`, and `contradicted`. A model is never permitted to self-assign `verified` status.
 - **Independent Scientific Verification:** Deterministic closed-form checkers natively implemented in Rust (`src/verification.rs`):
   - *Projectile Motion:* Closed-form Newtonian kinematics ($R = v^2\sin(2\theta)/g$, $T = 2v\sin\theta/g$, $H = v^2\sin^2\theta/(2g)$), boundary validations ($\theta=0^\circ, 90^\circ$), input constraints ($v \ge 0, g > 0$), and contradiction detection.
   - *Arithmetic:* Exact integer and floating-point verification for addition, subtraction, multiplication, and division with zero-division safety.
   - *Descriptive Statistics:* Sample mean, Bessel-corrected standard deviation ($N-1$), min, max, and count verification.
   - *Power-Law Fitting Consistency:* Verifies consistency with least-squares normal equations; empirical fits strictly retain `calculated` status and are never claimed as `verified`.
-- **Bounded Asynchronous Specialist Scheduling:** Dynamic DAG dependency resolution using Tokio `JoinSet` bounded by `SPECIALIST_CONCURRENCY` (1..=5, default 3). Includes serial execution mode (`SPECIALIST_CONCURRENCY=1`) and specialist failure isolation.
+- **Bounded Asynchronous Specialist Scheduling:** Dynamic DAG dependency resolution using Tokio `JoinSet` bounded by `SPECIALIST_CONCURRENCY` (1..=5, default 3). Includes serial execution mode (`SPECIALIST_CONCURRENCY=1`), dependency context propagation, dependency failure surfacing, and failure isolation.
 - **Five Scientific Specialist Roles:** Mathematics, Physics, Chemistry, Biology, and Medicinal Science with role-isolated allowlisted tool dispatch.
 - **Hosted Model Client & Bounded Retries:** Configurable OpenAI-compatible provider with structured JSON schema enforcement, token budget tracking, bounded retries on 500/503 errors, and offline mock transport.
 - **Isolated Python Worker:** CPython 3.13 virtual environment (`.venv-cpython313`) with pre-installed scientific libraries (`numpy`, `scipy`, `sympy`, `pandas`, `matplotlib`).
-- **Rust-Owned SQLite Persistence:** Additive schema migrations with automated pre-migration backup and cross-process database recovery.
-- **Modern Responsive Frontend:** Single-page application rendering real-time investigation progress, custom semantic epistemic badges, and interactive history.
+- **Rust-Owned SQLite Persistence:** Additive schema migrations (version 2) with automated pre-migration backup, append-only cognitive events log, and cross-process database recovery and resumption.
+- **Modern Responsive Frontend:** Single-page application rendering real-time investigation progress, cognitive control state, working memory summary, semantic epistemic badges, and interactive history.
 
 ## Verification & Test Suite
 
 - `scripts/check.ps1`: runs `cargo fmt --check`, `cargo clippy`, `cargo check`, and Python compilation checks.
 - `scripts/test.ps1`: runs the complete test suite including:
-  1. Rust unit & offline integration tests (**26 tests**, 0 failures).
+  1. Rust unit & offline integration tests (**38 tests**, 0 failures).
   2. Python calculation worker unit tests (**11 tests**, 0 failures).
   3. Frontend JavaScript syntax verification.
   4. Automated cross-process database persistence recovery test.
   5. Automated browser end-to-end verification (`scripts/test_browser_e2e.js`) using Chrome DevTools Protocol (CDP).
 
-## Limitations & Next Milestones
+## Documentation Links
 
-- **Live Hosted Inference:** Untested pending user-provided API credentials. Tested thoroughly via mock transport and injected fault simulations.
-- **Scholarly Literature Retrieval:** OpenAlex, Crossref, and PubMed integrations belong to subsequent milestones to support `evidence_supported` claims.
-- **Formal Verification:** Lean 4 theorem proving is planned as a future verification extension.
-- **Long-Term Memory & 3D Visualization:** Zep memory, Mol* 3D molecular visualization, and document ingestion belong to subsequent milestones. See [ARCHITECTURE.md](ARCHITECTURE.md), [DEVELOPMENT.md](DEVELOPMENT.md), and [BUILD_STATUS.md](BUILD_STATUS.md).
+- [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) — Comprehensive specification of the Milestone 1.3 cognitive control subsystem.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — System boundaries, components, and dataflow.
+- [DEVELOPMENT_ROADMAP.md](DEVELOPMENT_ROADMAP.md) — Complete roadmap and milestone trajectories.
+- [NEUROGENESIS_MASTER_CONTEXT.md](NEUROGENESIS_MASTER_CONTEXT.md) — Master context and operating guidelines.
+- [BUILD_STATUS.md](BUILD_STATUS.md) — Detailed build, test, and milestone verification records.

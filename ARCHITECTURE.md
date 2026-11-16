@@ -1,6 +1,9 @@
 # NeuroGenesis AI Architecture
+## Milestone 1.3: Cognitive Control Foundation
 
-## System Boundaries & Component Ownership
+---
+
+## 1. System Boundaries & Component Ownership
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -9,21 +12,30 @@
 │  ┌───────────────────────┐   ┌──────────────────────────────────────┐  │
 │  │   HTTP & Static API   │   │      Investigation Orchestrator      │  │
 │  │    (Contracts 1.0)    │   │  - Planning & Synthesis Routing      │  │
-│  └───────────┬───────────┘   │  - Bounded Asynchronous Scheduler    │  │
+│  └───────────┬───────────┘   │  - Dynamic DAG Dependency Scheduler  │  │
 │              │               │    (Tokio JoinSet, Concurrency 1..5) │  │
 │              │               └──────────────────┬───────────────────┘  │
 │              │                                  │                      │
 │              │       ┌──────────────────────────┴───────────────┐      │
+│              │       │       Cognitive Control Subsystem        │      │
+│              │       │  - Bounded Working Memory Engine         │      │
+│              │       │  - Hierarchical Goal & Agenda Manager    │      │
+│              │       │  - Selective Attention & Prioritisation  │      │
+│              │       │  - 10-Phase Executive Controller Loop    │      │
+│              │       │  - Metacognitive Health Monitor          │      │
+│              │       └──────────────────────────┬───────────────┘      │
+│              │                                  │                      │
+│              │       ┌──────────────────────────┴───────────────┐      │
 │              │       │       Independent Verification Engine    │      │
-│              │       │  - Newtonian Ballistics Derivation       │      │
+│              │       │  - Newtonian Ballistics Kinematics       │      │
 │              │       │  - Exact Arithmetic Validation           │      │
 │              │       │  - Descriptive Statistics Invariants     │      │
 │              │       │  - Power-Law Least-Squares Normal Eqns   │      │
 │              │       └──────────────────────────┬───────────────┘      │
 │              │                                  │                      │
 │  ┌───────────▼───────────┐                      │                      │
-│  │   SQLite Store        │◄─────────────────────┘                      │
-│  │   (rusqlite, backup)  │                                             │
+│  │   SQLite Store v2     │◄─────────────────────┘                      │
+│  │   (rusqlite, events)  │                                             │
 │  └───────────────────────┘                                             │
 └──────────────┬──────────────────────────────────┬──────────────────────┘
                │                                  │
@@ -38,60 +50,93 @@
 └───────────────────────────────┘  └─────────────────────────────────────┘
 ```
 
-### 1. Rust Application Core (`Axum`, `Tokio`, `rusqlite`)
-- **Orchestration & Workflow:** Owns planning, specialist dispatch, tool execution coordination, synthesis, and final status classification.
-- **Independent Verification:** Natively executes closed-form analytical verifications in Rust, completely independent of the Python worker.
-- **Bounded Asynchronous Scheduler:** Manages specialist concurrency via `tokio::task::JoinSet` with configurable limits (`SPECIALIST_CONCURRENCY`, 1..=5, default 3). Resolves subproblem dependency DAGs dynamically and isolates task failures.
-- **Persistence:** Direct SQLite integration with additive schema migrations, automatic pre-migration snapshots, and cross-process database recovery.
+### Component Roles
 
-### 2. Python Scientific Computation Worker (`engine/app.py`)
-- **Execution Model:** Subprocess executed within a dedicated CPython 3.13 virtual environment (`.venv-cpython313`). Communicates over stdin/stdout using versioned JSON contract `1.0`.
-- **Role:** Pure mathematical and scientific calculations.
-- **Security & Isolation:** Has no network access, model credentials, file system write permissions, or database connections. Cannot execute arbitrary code or shell commands.
-
-### 3. Model Provider Transport (`src/provider.rs`)
-- **Interface:** Abstract `ModelProvider` trait supporting `openai_compatible` and `mock`.
-- **Reliability:** Enforces structured JSON output matching requested schemas, bounded retries on 500/503 server errors with exponential backoff, rate limit handling, and token budgets.
-- **Mock Mode:** Explicitly labels outputs as mock and performs no hosted scientific analysis.
+1. **Rust Core Application:**
+   - **Cognitive Control (`src/cognition/`):** Manages working memory, attention prioritisation, hierarchical goals, completion criteria verification, and executive control loops.
+   - **Investigation Orchestrator (`src/orchestrator.rs`):** Schedules domain specialists across asynchronous tasks, resolving DAG dependencies and propagating tool outputs downstream.
+   - **Deterministic Verification (`src/verification.rs`):** Independently evaluates computational outputs in native Rust without model self-verification.
+   - **Persistence (`src/store.rs`):** Exclusively owns SQLite database reads, writes, schema migrations (version 2), and auditable append-only cognitive events.
+2. **Python Scientific Computation Worker (`engine/app.py`):**
+   - Pure mathematical calculations (NumPy, SciPy, SymPy) executed in a local subprocess over stdin/stdout.
+   - Zero database permissions, zero network access, and zero credential storage.
+3. **Model Provider Transport (`src/provider.rs`):**
+   - Supplies structured hypothesis proposals and language decomposition.
+   - Strictly subservient to Rust validation and cognitive state boundaries.
 
 ---
 
-## The Investigation Lifecycle
+## 2. Cognitive Control Flow
 
-1. **Planning Stage:**
-   - Rust creates an initial `Investigation` record in SQLite with status `Planning`.
-   - The planner decomposes the question into up to 5 specialist subproblems with explicit `id`, `specialist`, `task`, `depends_on`, and `required_tools` fields.
-2. **Specialist Execution Stage:**
-   - Subproblems are scheduled based on `SPECIALIST_CONCURRENCY`. If concurrency $\le 1$, subproblems run sequentially; otherwise, independent ready subproblems run in parallel.
-   - For each specialist, a distinct prompt is submitted to the model provider with role instructions.
-   - Specialist tool calls are validated against the role's allowlist (up to 3 tool calls per specialist).
-   - Tool arguments are dispatched to the Python worker.
-   - Python worker results are immediately routed into the Rust independent verification engine.
-   - Verification results are recorded with exact errors, tolerances, and status (`verified`, `calculated`, `contradicted`, or `uncertain`).
-   - SQLite is updated after each specialist completes to guarantee crash resilience.
-3. **Synthesis Stage:**
-   - The synthesis stage receives specialist reports, executed tool outputs, and verification results.
-   - **Epistemic Classification Rules:**
-     - A model cannot self-assign `verified` or `evidence_supported`.
-     - Claims referencing independently verified tools receive `verified`.
-     - Claims referencing unverified calculations receive `calculated`.
-     - Claims lacking source backing or verified calculations remain `hypothesis`.
-   - Final report is persisted to SQLite with status `Completed`.
+The cognitive architecture operates a discrete 10-phase control cycle:
+
+```
+  ┌──────────────┐
+  │   OBSERVE    │ ── Inspect working memory, active goals, and contradictions
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ EVALUATE     │ ── Evaluate completion criteria for active goals
+  │ GOALS        │    (Requires verified calculations, tools, or subgoals)
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ UPDATE       │ ── Transition goals: Pending -> Active (deps satisfied)
+  │ STATE        │    or Pending -> Blocked (deps failed)
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ ATTENTION &  │ ── Score candidate goals via readiness, contradictions,
+  │ PRIORITY     │    priority, uncertainty, and unknown variables
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ SELECT       │ ── Pick highest priority valid action from agenda or goal criteria
+  │ ACTION       │    (Check rolling loop detector)
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ VALIDATE     │ ── Enforce strict precondition allowlist
+  │ PRECONDS     │
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ EXECUTE      │ ── Dispatch calculation, independent verification, or state update
+  │ ACTION       │
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ EVALUATE     │ ── Record action result, measure latency, track failure counts
+  │ OUTCOME      │
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ UPDATE       │ ── Insert knowledge items, decay stale activations,
+  │ MEMORY       │    and deterministically evict low-retention items (capacity bounded)
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ METACOG      │ ── Evaluate progress, detect repeated failures, and emit audit event;
+  │ MONITOR      │    continue or stop on terminal condition
+  └──────────────┘
+```
 
 ---
 
-## Concurrency and Scheduling Rules
+## 3. Epistemic Classification Standards
 
-1. **Bound Limits:** `SPECIALIST_CONCURRENCY` is clamped to $1 \le C \le 5$.
-2. **Dependency Resolution:** A subproblem is only scheduled when all dependencies in its `depends_on` list have completed.
-3. **Deadlock Prevention:** Unsatisfied or cyclic dependencies are drained and recorded with `status: Failed`.
-4. **Failure Isolation:** A model timeout or tool failure in one specialist does not abort concurrent tasks or prevent synthesis.
+NeuroGenesis AI strictly enforces non-negotiable epistemic rules:
+- **`verified`:** Validated by deterministic closed-form Rust checkers or formal logic. Models are barred from self-assigning verified status.
+- **`calculated`:** Generated by an allowlisted deterministic tool (NumPy, SciPy, SymPy) without independent secondary verification.
+- **`evidence_supported`:** Backed by primary scholarly literature with verified DOI/PMCID provenance.
+- **`hypothesis`:** Model-generated or candidate proposition lacking independent verification.
+- **`uncertain`:** Explicitly identified boundary ambiguity or missing data.
+- **`contradicted`:** Mathematical inconsistency or empirical discrepancy.
 
 ---
 
-## Current Status and Limitations
+## 4. Current Milestone Status & Boundaries
 
-- **Hosted Model Credentials:** Safely verified; none configured in `.env`. Offline mock mode is fully operational.
-- **Scholarly Literature Retrieval:** OpenAlex, Crossref, and PubMed integrations will be added in subsequent milestones to support `evidence_supported` claims.
-- **Formal Verification:** Lean 4 integration is designed as an extension point for formal mathematical proofs.
-- **Long-Term Memory:** Zep conversational memory is planned for future milestones.
+- **Implemented:** Cognitive control loop, bounded working memory (retention scoring), hierarchical goals (completion criteria), selective attention, deterministic verification, asynchronous specialist scheduling with DAG dependency propagation, SQLite version 2 schema migration, cross-process persistence recovery, and responsive UI visibility.
+- **Deferred to Milestone 1.4+:** OpenAlex/Crossref/PubMed primary literature integration, Lean 4 formal mathematical proof checking, Zep conversational memory, and Mol* 3D molecular visualization.
+- **Permanently Excluded:** Notion integration.
