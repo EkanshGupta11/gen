@@ -15,10 +15,11 @@ use crate::{
         policy::ALLOWED_SCIENTIFIC_TOOLS,
         state::{
             CognitiveState, ContradictionResolution, KnowledgeItem, Provenance, ResolutionOutcome,
+            check_contradiction_comparability,
         },
         working_memory::KnowledgeItemType,
     },
-    contracts::{AgentExecutionStatus, AgentReport, EpistemicStatus, ToolExecution},
+    contracts::{AgentExecutionStatus, AgentReport, EpistemicStatus, Specialist, ToolExecution},
     provider::{self, GenerationRequest, GenerationStage, ModelProvider, RequestBudget},
     verification, worker,
 };
@@ -127,10 +128,11 @@ impl AsyncActionExecutor {
                     Err(e) => json!({"error": e}),
                 };
 
+                let specialist = resolve_specialist_for_tool_execution(goal_id, tool, state);
                 let k_item_id = format!("calc-{}", Uuid::new_v4());
                 let t_exec = crate::contracts::ToolExecution {
                     id: k_item_id.clone(),
-                    specialist: crate::contracts::Specialist::Mathematics,
+                    specialist: specialist.clone(),
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                     output: worker_val.ok(),
@@ -154,7 +156,8 @@ impl AsyncActionExecutor {
                     id: k_item_id.clone(),
                     item_type: KnowledgeItemType::Calculation,
                     content: tool_json.clone(),
-                    provenance: Provenance::new("scientific_tool").with_source_id(tool),
+                    provenance: Provenance::new("scientific_tool")
+                        .with_source_id(specialist.as_str()),
                     epistemic_status: epistemic_status.clone(),
                     related_goals: vec![goal_id.clone()],
                     related_entities: vec![],
@@ -351,32 +354,10 @@ impl AsyncActionExecutor {
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default();
 
-                if !verified_evidence.is_empty() {
+                if verified_evidence.is_empty() {
                     let resolution = ContradictionResolution {
                         contradiction_id: contradiction_id.clone(),
-                        conflicting_items: conflicting_ids.clone(),
-                        proposed_resolution: format!(
-                            "Arbitrated via {resolution_strategy}: retained verified evidence {:?}, rejected contradicted items {:?}",
-                            verified_evidence, contradicted_items
-                        ),
-                        supporting_evidence_refs: verified_evidence,
-                        verification_method: "rust_independent_verification".into(),
-                        outcome: ResolutionOutcome::Resolved,
-                        timestamp: now,
-                    };
-                    state.contradictions[idx].resolved = true;
-                    state.contradictions[idx].resolution = Some(resolution.clone());
-
-                    ActionResult::succeeded(
-                        action_id,
-                        action.name(),
-                        serde_json::to_value(&resolution).unwrap_or_default(),
-                        duration_ms,
-                    )
-                } else {
-                    let resolution = ContradictionResolution {
-                        contradiction_id: contradiction_id.clone(),
-                        conflicting_items: conflicting_ids.clone(),
+                        conflicting_items: conflicting_ids,
                         proposed_resolution: format!(
                             "Insufficient verified evidence to resolve via {resolution_strategy}. Requires human review."
                         ),
@@ -388,15 +369,119 @@ impl AsyncActionExecutor {
                     state.contradictions[idx].resolved = false;
                     state.contradictions[idx].resolution = Some(resolution.clone());
 
-                    ActionResult::new(
+                    return ActionResult::new(
                         action_id,
                         action.name(),
                         ActionExecutionStatus::Uncertain,
                         serde_json::to_value(&resolution).unwrap_or_default(),
                         Some("Cannot resolve contradiction without verified evidence".into()),
                         duration_ms,
-                    )
+                    );
                 }
+
+                if verified_evidence.len() > 1 {
+                    let resolution = ContradictionResolution {
+                        contradiction_id: contradiction_id.clone(),
+                        conflicting_items: conflicting_ids,
+                        proposed_resolution: format!(
+                            "Multiple conflicting verified evidence items found ({:?}). Cannot automatically resolve contradiction via {resolution_strategy}. Requires human review.",
+                            verified_evidence
+                        ),
+                        supporting_evidence_refs: verified_evidence,
+                        verification_method: "multiple_conflicting_verified".into(),
+                        outcome: ResolutionOutcome::RequiresHumanReview,
+                        timestamp: now,
+                    };
+                    state.contradictions[idx].resolved = false;
+                    state.contradictions[idx].resolution = Some(resolution.clone());
+
+                    return ActionResult::new(
+                        action_id,
+                        action.name(),
+                        ActionExecutionStatus::Uncertain,
+                        serde_json::to_value(&resolution).unwrap_or_default(),
+                        Some("Multiple conflicting verified items require human review".into()),
+                        duration_ms,
+                    );
+                }
+
+                // Exactly one verified evidence item: check comparability with all other conflicting items
+                let verified_id = &verified_evidence[0];
+                let verified_item = state.knowledge_items.get(verified_id).cloned();
+
+                let mut comparability_errors = Vec::new();
+                if let Some(v_item) = &verified_item {
+                    for other_id in &conflicting_ids {
+                        if other_id == verified_id {
+                            continue;
+                        }
+                        if let Some(other_item) = state.knowledge_items.get(other_id) {
+                            if let Err(reason) =
+                                check_contradiction_comparability(v_item, other_item)
+                            {
+                                comparability_errors.push(format!("Item '{other_id}': {reason}"));
+                            }
+                        } else {
+                            comparability_errors.push(format!(
+                                "Conflicting item '{other_id}' missing from knowledge base"
+                            ));
+                        }
+                    }
+                } else {
+                    comparability_errors
+                        .push("Verified evidence item missing from knowledge base".into());
+                }
+
+                if !comparability_errors.is_empty() {
+                    let resolution = ContradictionResolution {
+                        contradiction_id: contradiction_id.clone(),
+                        conflicting_items: conflicting_ids,
+                        proposed_resolution: format!(
+                            "Verified evidence is not directly comparable to conflicting items: {}. Requires human review.",
+                            comparability_errors.join("; ")
+                        ),
+                        supporting_evidence_refs: verified_evidence,
+                        verification_method: "comparability_check_failed".into(),
+                        outcome: ResolutionOutcome::RequiresHumanReview,
+                        timestamp: now,
+                    };
+                    state.contradictions[idx].resolved = false;
+                    state.contradictions[idx].resolution = Some(resolution.clone());
+
+                    return ActionResult::new(
+                        action_id,
+                        action.name(),
+                        ActionExecutionStatus::Uncertain,
+                        serde_json::to_value(&resolution).unwrap_or_default(),
+                        Some(format!(
+                            "Incomparable evidence: {}",
+                            comparability_errors.join("; ")
+                        )),
+                        duration_ms,
+                    );
+                }
+
+                let resolution = ContradictionResolution {
+                    contradiction_id: contradiction_id.clone(),
+                    conflicting_items: conflicting_ids,
+                    proposed_resolution: format!(
+                        "Arbitrated via {resolution_strategy}: retained verified evidence {:?}, rejected contradicted items {:?}",
+                        verified_evidence, contradicted_items
+                    ),
+                    supporting_evidence_refs: verified_evidence,
+                    verification_method: "rust_independent_verification".into(),
+                    outcome: ResolutionOutcome::Resolved,
+                    timestamp: now,
+                };
+                state.contradictions[idx].resolved = true;
+                state.contradictions[idx].resolution = Some(resolution.clone());
+
+                ActionResult::succeeded(
+                    action_id,
+                    action.name(),
+                    serde_json::to_value(&resolution).unwrap_or_default(),
+                    duration_ms,
+                )
             }
 
             ExecutiveAction::RequestSpecialistAnalysis {
@@ -882,6 +967,91 @@ impl AsyncActionExecutor {
                     duration_ms,
                 )
             }
+        }
+    }
+}
+
+/// Resolves the initiating scientific specialist for a tool execution dynamically
+/// from the goal's completion criteria, goal description, parent goal, linked knowledge items,
+/// or tool allowlist capabilities.
+pub fn resolve_specialist_for_tool_execution(
+    goal_id: &str,
+    tool: &str,
+    state: &CognitiveState,
+) -> Specialist {
+    // 1. Check goal's completion criteria for SpecialistReportReceived
+    if let Some(goal) = state.goals.get_goal(goal_id) {
+        for crit in &goal.completion_criteria {
+            if let CompletionCriterion::SpecialistReportReceived { specialist } = crit
+                && let Some(spec) = Specialist::from_str(specialist)
+            {
+                return spec;
+            }
+        }
+        let desc_lower = goal.description.to_lowercase();
+        if desc_lower.contains("physics") {
+            return Specialist::Physics;
+        } else if desc_lower.contains("chemistry") {
+            return Specialist::Chemistry;
+        } else if desc_lower.contains("biology") {
+            return Specialist::Biology;
+        } else if desc_lower.contains("medicinal") {
+            return Specialist::MedicinalScience;
+        } else if desc_lower.contains("mathematics") || desc_lower.contains("math") {
+            return Specialist::Mathematics;
+        }
+        if let Some(parent_id) = &goal.parent_goal
+            && let Some(parent) = state.goals.get_goal(parent_id)
+        {
+            let pdesc_lower = parent.description.to_lowercase();
+            if pdesc_lower.contains("physics") {
+                return Specialist::Physics;
+            } else if pdesc_lower.contains("chemistry") {
+                return Specialist::Chemistry;
+            } else if pdesc_lower.contains("biology") {
+                return Specialist::Biology;
+            } else if pdesc_lower.contains("medicinal") {
+                return Specialist::MedicinalScience;
+            } else if pdesc_lower.contains("mathematics") || pdesc_lower.contains("math") {
+                return Specialist::Mathematics;
+            }
+        }
+    }
+
+    // 2. Search knowledge items related to this goal for a specialist report or provenance
+    for k in state.knowledge_items.values() {
+        if k.related_goals.iter().any(|rg| rg == goal_id) {
+            if k.provenance.source_type == "specialist_report"
+                && let Some(src_id) = &k.provenance.source_id
+                && let Some(spec) = Specialist::from_str(src_id)
+            {
+                return spec;
+            }
+            if let Some(spec_str) = k.content.get("specialist").and_then(Value::as_str)
+                && let Some(spec) = Specialist::from_str(spec_str)
+            {
+                return spec;
+            }
+        }
+    }
+
+    // 3. Fallback based on tool capabilities
+    match tool {
+        "projectile" => Specialist::Physics,
+        _ => {
+            let specialists = [
+                Specialist::Mathematics,
+                Specialist::Physics,
+                Specialist::Chemistry,
+                Specialist::Biology,
+                Specialist::MedicinalScience,
+            ];
+            for s in &specialists {
+                if s.allowed_tools().contains(&tool) {
+                    return s.clone();
+                }
+            }
+            Specialist::Mathematics
         }
     }
 }

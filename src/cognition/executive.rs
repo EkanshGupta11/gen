@@ -11,11 +11,12 @@ use crate::{
         actions::{ActionExecutionStatus, ActionResult, ExecutiveAction, StopReason},
         attention::AttentionEngine,
         events::{CognitiveEvent, CognitiveEventType},
+        executor::resolve_specialist_for_tool_execution,
         goals::{CompletionCriterion, Goal, GoalStatus},
         policy::{LoopDetector, validate_action_preconditions},
         state::{
-            CognitiveState, ContradictionResolution, ExecutivePhase, KnowledgeItem, Provenance,
-            ResolutionOutcome,
+            check_contradiction_comparability, CognitiveState, ContradictionResolution,
+            ExecutivePhase, KnowledgeItem, Provenance, ResolutionOutcome,
         },
         working_memory::KnowledgeItemType,
     },
@@ -53,6 +54,7 @@ pub struct ExecutiveConfig {
     pub max_actions: u32,
     pub timeout: Duration,
     pub working_memory_capacity: usize,
+    pub max_concurrency: usize,
 }
 
 impl Default for ExecutiveConfig {
@@ -62,6 +64,7 @@ impl Default for ExecutiveConfig {
             max_actions: 100,
             timeout: Duration::from_secs(30),
             working_memory_capacity: 64,
+            max_concurrency: 1,
         }
     }
 }
@@ -189,6 +192,19 @@ impl ExecutiveController {
             return Ok(None);
         }
 
+        // If the primary synthesis goal has reached completion, the investigation objective is achieved
+        let synthesis_completed = self.state.goals.goals.values().any(|g| {
+            g.status == GoalStatus::Completed
+                && g.completion_criteria
+                    .iter()
+                    .any(|c| matches!(c, CompletionCriterion::SynthesisCompleted))
+        });
+
+        if synthesis_completed {
+            self.stop(StopReason::ObjectiveAchieved);
+            return Ok(None);
+        }
+
         // 5. ATTENTION AND PRIORITISATION
         self.state.executive.current_phase = ExecutivePhase::AttentionPrioritisation;
         let attention_decision = self.attention_engine.select_focus(
@@ -266,6 +282,46 @@ impl ExecutiveController {
                 self.step_commit(&action, outcome)?;
                 Ok(None)
             }
+        }
+    }
+
+    /// Returns up to `limit` ready agenda actions for distinct active goals that do not depend on each other.
+    pub fn get_concurrent_ready_actions(&self, limit: usize) -> Vec<ExecutiveAction> {
+        if limit <= 1 || self.state.is_stopped() {
+            return Vec::new();
+        }
+        let ready_items = self.state.goals.get_ready_agenda_items();
+        if ready_items.len() <= 1 {
+            return Vec::new();
+        }
+
+        let mut actions = Vec::new();
+        let mut seen_goals = std::collections::HashSet::new();
+
+        for item in ready_items {
+            if actions.len() >= limit {
+                break;
+            }
+            if seen_goals.contains(&item.goal_id) {
+                continue;
+            }
+            // Ensure this goal does not depend on any other goal currently in the batch
+            if let Some(goal) = self.state.goals.get_goal(&item.goal_id) {
+                let conflicts_with_batch =
+                    goal.dependencies.iter().any(|dep| seen_goals.contains(dep));
+                if !conflicts_with_batch
+                    && validate_action_preconditions(&item.action, &self.state).is_ok()
+                {
+                    seen_goals.insert(item.goal_id.clone());
+                    actions.push(item.action.clone());
+                }
+            }
+        }
+
+        if actions.len() > 1 {
+            actions
+        } else {
+            Vec::new()
         }
     }
 
@@ -492,8 +548,10 @@ impl ExecutiveController {
                 let (v_res, status) =
                     verification::verify_tool(tool, &exec_args, &Ok(computed_val.clone()));
 
+                let specialist = resolve_specialist_for_tool_execution(goal_id, tool, &self.state);
                 let output = json!({
                     "tool": tool,
+                    "specialist": specialist.as_str(),
                     "arguments": exec_args,
                     "output": computed_val,
                     "verification": v_res,
@@ -506,7 +564,7 @@ impl ExecutiveController {
                     id: k_item_id.clone(),
                     item_type: KnowledgeItemType::Calculation,
                     content: output.clone(),
-                    provenance: Provenance::new("scientific_tool").with_source_id(tool),
+                    provenance: Provenance::new("scientific_tool").with_source_id(specialist.as_str()),
                     epistemic_status: status.clone(),
                     related_goals: vec![goal_id.clone()],
                     related_entities: vec![],
@@ -704,29 +762,7 @@ impl ExecutiveController {
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default();
 
-                if !verified_evidence.is_empty() {
-                    let res = ContradictionResolution {
-                        contradiction_id: contradiction_id.clone(),
-                        conflicting_items: conflicting_ids,
-                        proposed_resolution: format!(
-                            "Resolved via {resolution_strategy}: verified evidence {:?} upheld, contradicted {:?} rejected",
-                            verified_evidence, contradicted_items
-                        ),
-                        supporting_evidence_refs: verified_evidence,
-                        verification_method: "rust_independent_verification".into(),
-                        outcome: ResolutionOutcome::Resolved,
-                        timestamp: now,
-                    };
-                    self.state.contradictions[idx].resolved = true;
-                    self.state.contradictions[idx].resolution = Some(res.clone());
-
-                    ActionResult::succeeded(
-                        action_id,
-                        action.name(),
-                        serde_json::to_value(&res).unwrap_or_default(),
-                        duration_ms,
-                    )
-                } else {
+                if verified_evidence.is_empty() {
                     let res = ContradictionResolution {
                         contradiction_id: contradiction_id.clone(),
                         conflicting_items: conflicting_ids,
@@ -741,15 +777,111 @@ impl ExecutiveController {
                     self.state.contradictions[idx].resolved = false;
                     self.state.contradictions[idx].resolution = Some(res.clone());
 
-                    ActionResult::new(
+                    return ActionResult::new(
                         action_id,
                         action.name(),
                         ActionExecutionStatus::Uncertain,
                         serde_json::to_value(&res).unwrap_or_default(),
                         Some("Cannot resolve contradiction without verified evidence".into()),
                         duration_ms,
-                    )
+                    );
                 }
+
+                if verified_evidence.len() > 1 {
+                    let res = ContradictionResolution {
+                        contradiction_id: contradiction_id.clone(),
+                        conflicting_items: conflicting_ids,
+                        proposed_resolution: format!(
+                            "Multiple conflicting verified evidence items found ({:?}). Cannot automatically resolve contradiction via {resolution_strategy}. Requires human review.",
+                            verified_evidence
+                        ),
+                        supporting_evidence_refs: verified_evidence,
+                        verification_method: "multiple_conflicting_verified".into(),
+                        outcome: ResolutionOutcome::RequiresHumanReview,
+                        timestamp: now,
+                    };
+                    self.state.contradictions[idx].resolved = false;
+                    self.state.contradictions[idx].resolution = Some(res.clone());
+
+                    return ActionResult::new(
+                        action_id,
+                        action.name(),
+                        ActionExecutionStatus::Uncertain,
+                        serde_json::to_value(&res).unwrap_or_default(),
+                        Some("Multiple conflicting verified items require human review".into()),
+                        duration_ms,
+                    );
+                }
+
+                // Exactly one verified evidence item: check comparability with all other conflicting items
+                let verified_id = &verified_evidence[0];
+                let verified_item = self.state.knowledge_items.get(verified_id).cloned();
+
+                let mut comparability_errors = Vec::new();
+                if let Some(v_item) = &verified_item {
+                    for other_id in &conflicting_ids {
+                        if other_id == verified_id {
+                            continue;
+                        }
+                        if let Some(other_item) = self.state.knowledge_items.get(other_id) {
+                            if let Err(reason) = check_contradiction_comparability(v_item, other_item) {
+                                comparability_errors.push(format!("Item '{other_id}': {reason}"));
+                            }
+                        } else {
+                            comparability_errors.push(format!("Conflicting item '{other_id}' missing from knowledge base"));
+                        }
+                    }
+                } else {
+                    comparability_errors.push("Verified evidence item missing from knowledge base".into());
+                }
+
+                if !comparability_errors.is_empty() {
+                    let res = ContradictionResolution {
+                        contradiction_id: contradiction_id.clone(),
+                        conflicting_items: conflicting_ids,
+                        proposed_resolution: format!(
+                            "Verified evidence is not directly comparable to conflicting items: {}. Requires human review.",
+                            comparability_errors.join("; ")
+                        ),
+                        supporting_evidence_refs: verified_evidence,
+                        verification_method: "comparability_check_failed".into(),
+                        outcome: ResolutionOutcome::RequiresHumanReview,
+                        timestamp: now,
+                    };
+                    self.state.contradictions[idx].resolved = false;
+                    self.state.contradictions[idx].resolution = Some(res.clone());
+
+                    return ActionResult::new(
+                        action_id,
+                        action.name(),
+                        ActionExecutionStatus::Uncertain,
+                        serde_json::to_value(&res).unwrap_or_default(),
+                        Some(format!("Incomparable evidence: {}", comparability_errors.join("; "))),
+                        duration_ms,
+                    );
+                }
+
+                let res = ContradictionResolution {
+                    contradiction_id: contradiction_id.clone(),
+                    conflicting_items: conflicting_ids,
+                    proposed_resolution: format!(
+                        "Resolved via {resolution_strategy}: verified evidence {:?} upheld, contradicted {:?} rejected",
+                        verified_evidence, contradicted_items
+                    ),
+                    supporting_evidence_refs: verified_evidence,
+                    verification_method: "rust_independent_verification".into(),
+                    outcome: ResolutionOutcome::Resolved,
+                    timestamp: now,
+                };
+                self.state.contradictions[idx].resolved = true;
+                self.state.contradictions[idx].resolution = Some(res.clone());
+
+                ActionResult::succeeded(
+                    action_id,
+                    action.name(),
+                    serde_json::to_value(&res).unwrap_or_default(),
+                    duration_ms,
+                )
             }
             ExecutiveAction::UpdateCognitiveState { update_summary } => {
                 self.state.context.current_stage = update_summary.clone();

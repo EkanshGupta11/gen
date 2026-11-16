@@ -324,6 +324,7 @@ mod tests {
                 max_actions: 20,
                 timeout: Duration::from_secs(5),
                 working_memory_capacity: 10,
+                max_concurrency: 1,
             },
         );
 
@@ -555,6 +556,363 @@ mod tests {
         assert_eq!(
             controller.state.executive.loop_detection_history,
             vec!["execute_scientific_tool:Some(\"goal-1\")"]
+        );
+    }
+
+    #[test]
+    fn test_multiple_verified_conflicting_evidence_requires_human_review() {
+        let mut controller = ExecutiveController::new(
+            "inv-multi-verified",
+            "Test contradiction with conflicting verified items",
+            ExecutiveConfig::default(),
+        );
+
+        controller.state.record_contradiction(
+            "contra-conflicting-verified",
+            "Two independent experiments verified conflicting values",
+            vec!["verified-calc-1".into(), "verified-calc-2".into()],
+        );
+
+        let k1 = KnowledgeItem {
+            id: "verified-calc-1".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({"tool": "projectile", "arguments": {"speed": 20.0, "angle_degrees": 35.0}, "output": {"range_m": 38.33}}),
+            provenance: Provenance::new("scientific_tool").with_source_id("physics"),
+            epistemic_status: EpistemicStatus::Verified,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+        let k2 = KnowledgeItem {
+            id: "verified-calc-2".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({"tool": "projectile", "arguments": {"speed": 20.0, "angle_degrees": 35.0}, "output": {"range_m": 42.15}}),
+            provenance: Provenance::new("scientific_tool").with_source_id("physics"),
+            epistemic_status: EpistemicStatus::Verified,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+        controller.state.add_knowledge_item(k1);
+        controller.state.add_knowledge_item(k2);
+
+        let resolve_action = ExecutiveAction::ResolveContradiction {
+            contradiction_id: "contra-conflicting-verified".into(),
+            resolution_strategy: "deterministic_arbitration".into(),
+        };
+
+        let outcome = controller.execute_action(&resolve_action);
+
+        // Multiple conflicting verified evidence MUST NOT automatically resolve!
+        assert_eq!(outcome.status, ActionExecutionStatus::Uncertain);
+        assert!(!controller.state.contradictions[0].resolved);
+        let res = controller.state.contradictions[0]
+            .resolution
+            .as_ref()
+            .expect("Resolution record must be created");
+        assert_eq!(res.outcome, ResolutionOutcome::RequiresHumanReview);
+        assert!(
+            res.proposed_resolution
+                .contains("Multiple conflicting verified evidence items")
+        );
+    }
+
+    #[test]
+    fn test_incomparable_evidence_units_or_assumptions_requires_human_review() {
+        let mut controller = ExecutiveController::new(
+            "inv-incomparable",
+            "Test incomparability arbitration",
+            ExecutiveConfig::default(),
+        );
+
+        // Case 1: Conflicting Physical Assumptions (ideal vacuum vs air resistance)
+        controller.state.record_contradiction(
+            "contra-assumption-mismatch",
+            "Calculation in vacuum vs calculation in fluid",
+            vec!["calc-vacuum".into(), "calc-air".into()],
+        );
+
+        let v_item = KnowledgeItem {
+            id: "calc-vacuum".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"speed": 20.0, "angle_degrees": 35.0},
+                "assumptions": ["ideal vacuum", "no drag"],
+                "output": {"range_m": 38.33}
+            }),
+            provenance: Provenance::new("scientific_tool").with_source_id("physics"),
+            epistemic_status: EpistemicStatus::Verified,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+        let o_item = KnowledgeItem {
+            id: "calc-air".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"speed": 20.0, "angle_degrees": 35.0},
+                "assumptions": ["air resistance", "turbulent drag"],
+                "output": {"range_m": 29.50}
+            }),
+            provenance: Provenance::new("specialist_report").with_source_id("physics"),
+            epistemic_status: EpistemicStatus::Uncertain,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+        controller.state.add_knowledge_item(v_item);
+        controller.state.add_knowledge_item(o_item);
+
+        let outcome = controller.execute_action(&ExecutiveAction::ResolveContradiction {
+            contradiction_id: "contra-assumption-mismatch".into(),
+            resolution_strategy: "assumption_aware_arbitration".into(),
+        });
+
+        assert_eq!(outcome.status, ActionExecutionStatus::Uncertain);
+        assert!(!controller.state.contradictions[0].resolved);
+        let res = controller.state.contradictions[0]
+            .resolution
+            .as_ref()
+            .unwrap();
+        assert_eq!(res.outcome, ResolutionOutcome::RequiresHumanReview);
+        assert!(
+            res.proposed_resolution
+                .contains("air resistance vs ideal vacuum")
+        );
+
+        // Case 2: Unit mismatch
+        controller.state.record_contradiction(
+            "contra-unit-mismatch",
+            "Meters vs feet mismatch",
+            vec!["calc-meters".into(), "calc-feet".into()],
+        );
+        let m_item = KnowledgeItem {
+            id: "calc-meters".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({"tool": "projectile", "units": "meters", "output": {"range": 38.33}}),
+            provenance: Provenance::new("scientific_tool").with_source_id("physics"),
+            epistemic_status: EpistemicStatus::Verified,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+        let f_item = KnowledgeItem {
+            id: "calc-feet".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({"tool": "projectile", "units": "feet", "output": {"range": 125.75}}),
+            provenance: Provenance::new("specialist_report").with_source_id("physics"),
+            epistemic_status: EpistemicStatus::Uncertain,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+        controller.state.add_knowledge_item(m_item);
+        controller.state.add_knowledge_item(f_item);
+
+        let outcome2 = controller.execute_action(&ExecutiveAction::ResolveContradiction {
+            contradiction_id: "contra-unit-mismatch".into(),
+            resolution_strategy: "unit_aware_arbitration".into(),
+        });
+        assert_eq!(outcome2.status, ActionExecutionStatus::Uncertain);
+        assert!(!controller.state.contradictions[1].resolved);
+        let res2 = controller.state.contradictions[1]
+            .resolution
+            .as_ref()
+            .unwrap();
+        assert_eq!(res2.outcome, ResolutionOutcome::RequiresHumanReview);
+        assert!(res2.proposed_resolution.contains("Incompatible units"));
+    }
+
+    #[test]
+    fn test_correct_specialist_provenance_preserved() {
+        use crate::cognition::executor::resolve_specialist_for_tool_execution;
+        use crate::contracts::Specialist;
+
+        let mut controller = ExecutiveController::new(
+            "inv-provenance",
+            "Test specialist provenance preservation",
+            ExecutiveConfig::default(),
+        );
+
+        // Goal 1: Physics goal with CompletionCriterion::SpecialistReportReceived
+        let goal_physics = Goal {
+            id: "goal-phys".into(),
+            description: "Analyze kinetic ballistics".into(),
+            parent_goal: None,
+            priority: 80,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SpecialistReportReceived {
+                specialist: "physics".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        controller.state.goals.add_goal(goal_physics).unwrap();
+
+        let resolved_phys =
+            resolve_specialist_for_tool_execution("goal-phys", "projectile", &controller.state);
+        assert_eq!(
+            resolved_phys,
+            Specialist::Physics,
+            "Physics goal must resolve to Specialist::Physics"
+        );
+
+        // Goal 2: Chemistry subproblem by description
+        let goal_chem = Goal {
+            id: "goal-chem".into(),
+            description: "Perform Chemistry molecular weight calculation".into(),
+            parent_goal: None,
+            priority: 70,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        controller.state.goals.add_goal(goal_chem).unwrap();
+
+        let resolved_chem =
+            resolve_specialist_for_tool_execution("goal-chem", "arithmetic", &controller.state);
+        assert_eq!(
+            resolved_chem,
+            Specialist::Chemistry,
+            "Chemistry description must resolve to Specialist::Chemistry"
+        );
+
+        // Action execution assigns proper provenance and specialist in KnowledgeItem
+        let action = ExecutiveAction::ExecuteScientificTool {
+            tool: "projectile".into(),
+            arguments: json!({"speed": 20.0, "angle_degrees": 35.0}),
+            goal_id: "goal-phys".into(),
+        };
+        let outcome = controller.execute_action(&action);
+        assert!(outcome.success);
+
+        let k_item = controller
+            .state
+            .knowledge_items
+            .values()
+            .find(|k| k.related_goals.contains(&"goal-phys".to_string()))
+            .expect("Knowledge item must be created for physics tool");
+
+        assert_eq!(
+            k_item.provenance.source_id.as_deref(),
+            Some("physics"),
+            "Provenance source_id must be 'physics', NOT hardcoded 'mathematics'"
+        );
+        assert_eq!(
+            k_item
+                .content
+                .get("specialist")
+                .and_then(serde_json::Value::as_str),
+            Some("physics")
+        );
+    }
+
+    #[test]
+    fn test_concurrency_behaviour_serial_vs_parallel() {
+        let mut controller = ExecutiveController::new(
+            "inv-concurrency",
+            "Test serial vs parallel agenda scheduling",
+            ExecutiveConfig {
+                max_concurrency: 2,
+                ..Default::default()
+            },
+        );
+
+        // Add 2 independent goals
+        let g1 = Goal {
+            id: "g1".into(),
+            description: "Independent subproblem 1".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SpecialistReportReceived {
+                specialist: "physics".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        let g2 = Goal {
+            id: "g2".into(),
+            description: "Independent subproblem 2".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SpecialistReportReceived {
+                specialist: "mathematics".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        controller.state.goals.add_goal(g1).unwrap();
+        controller.state.goals.add_goal(g2).unwrap();
+
+        controller
+            .state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag1".into(),
+                goal_id: "g1".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: crate::contracts::Specialist::Physics,
+                    task: "Phys task".into(),
+                    goal_id: "g1".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+        controller
+            .state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag2".into(),
+                goal_id: "g2".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: crate::contracts::Specialist::Mathematics,
+                    task: "Math task".into(),
+                    goal_id: "g2".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+
+        // 1. Under serial limit = 1: get_concurrent_ready_actions returns empty
+        let serial_batch = controller.get_concurrent_ready_actions(1);
+        assert!(
+            serial_batch.is_empty(),
+            "Serial mode (limit=1) must not return parallel batch"
+        );
+
+        // 2. Under parallel limit = 2: returns both independent actions
+        let parallel_batch = controller.get_concurrent_ready_actions(2);
+        assert_eq!(
+            parallel_batch.len(),
+            2,
+            "Parallel mode (limit=2) must schedule both independent actions"
+        );
+
+        // 3. If g2 depends on g1, dependent action must NOT be scheduled in parallel batch
+        controller
+            .state
+            .goals
+            .goals
+            .get_mut("g2")
+            .unwrap()
+            .dependencies = vec!["g1".into()];
+        let dependent_batch = controller.get_concurrent_ready_actions(2);
+        assert!(
+            dependent_batch.is_empty(),
+            "Actions with dependency conflicts must not be executed concurrently"
         );
     }
 }

@@ -32,7 +32,7 @@ This document outlines completed milestones, current progress, and future develo
 ### Milestone 1.3: Cognitive Control Foundation
 - Implemented modular cognitive state, bounded working memory, hierarchical goals, selective attention, executive controller, and schema version 2 SQLite persistence.
 
-### Milestone 1.3.1: Cognitive Runtime Integration & Epistemic Integrity (Current Milestone)
+### Milestone 1.3.1: Cognitive Runtime Integration & Epistemic Integrity
 - **Production Cognitive Runtime:** Implemented `CognitiveRuntime` and `AsyncActionExecutor`, transferring orchestration authority from passive pipelines to active discrete cognitive control cycles.
 - **Real Scientific Computation Execution:** Replaced placeholder mocking in the controller with real asynchronous execution via `worker::invoke` in CPython 3.13 against `engine/app.py`.
 - **Non-Bypassable Verification:** Enforced mandatory independent Rust verification checkers for all deterministic tool executions, preventing self-certification of epistemic statuses.
@@ -41,6 +41,15 @@ This document outlines completed milestones, current progress, and future develo
 - **Goal Completion Criteria Scoping & Failure Isolation:** Strictly scoped completion criteria to specific subproblem goal IDs. Subproblem failures cleanly isolate downstream dependencies without aborting overall investigation synthesis.
 - **State Recovery & Budget Preservation:** Fully integrated SQLite snapshot and append-only event persistence, restoring historical budgets (`total_actions_executed`) and rolling loop detection histories on restart.
 - **Test Suite Expansion:** Expanded test suite to 42 passing Rust unit/integration tests and verified end-to-end browser DOM rendering.
+
+### Milestone 1.3.2: Runtime Reliability Closure (Current Milestone)
+- **Runtime Error Propagation:** Captured `runtime.run().await` return values; propagated failures cleanly to ensure runtime errors cannot result in `InvestigationStatus::Completed`.
+- **Atomic Cognitive Persistence & Recovery:** Implemented single-transaction snapshot and event updates with ACID rollback; pending events in memory are never cleared until durably committed to SQLite.
+- **Honest Terminal Status:** Added `InvestigationStatus::Interrupted` and implemented exhaustive `StopReason` outcome mapping so budget exhaustion, timeouts, deadlocks, and cancellations never silently report success.
+- **Specialist Provenance Preservation:** Removed hardcoded `Specialist::Mathematics` tool attribution; dynamically resolved initiating specialists based on goal completion criteria, descriptions, and allowlists.
+- **Bounded Concurrency Scheduling:** Restored parallel execution for independent ready subproblems via `max_concurrency`, with sequential state commitment ensuring executive control and state consistency.
+- **Scientific Contradiction Arbitration:** Enforced deep comparability checks for proposition identity, physical assumptions (e.g. ideal vacuum vs air resistance), conditions, and units; multiple conflicting verified items route to `RequiresHumanReview`.
+- **Verified Test Suite Expansion:** Expanded Rust test suite to 50 passing unit/integration tests, 11 Python tests, cross-process persistence recovery, and headless Chrome browser E2E verification.
 
 ---
 

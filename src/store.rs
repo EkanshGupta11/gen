@@ -93,14 +93,53 @@ impl Store {
         investigation_id: String,
         state: &crate::cognition::CognitiveState,
     ) -> Result<(), StoreError> {
+        self.persist_cognitive_snapshot_and_events(investigation_id, state, Vec::new())
+            .await
+    }
+
+    pub async fn persist_cognitive_snapshot_and_events(
+        &self,
+        investigation_id: String,
+        state: &crate::cognition::CognitiveState,
+        events: Vec<crate::cognition::CognitiveEvent>,
+    ) -> Result<(), StoreError> {
         let path = self.path.clone();
         let state_json = serde_json::to_string(state).map_err(|_| StoreError::InvalidStoredJson)?;
         task::spawn_blocking(move || {
-            let connection = open_connection(&path)?;
-            connection.execute(
+            let mut connection = open_connection(&path)?;
+            let tx = connection.transaction()?;
+            let rows_affected = tx.execute(
                 "UPDATE investigations SET cognitive_state_json=?1 WHERE id=?2",
                 params![state_json, investigation_id],
             )?;
+            if rows_affected == 0 {
+                let now = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                tx.execute(
+                    "INSERT INTO investigations (id, question, created_at, result, updated_at, status, cognitive_state_json)
+                     VALUES (?1, '', ?2, '{}', ?2, 'executing', ?3)",
+                    params![investigation_id, now, state_json],
+                )?;
+            }
+            for ev in &events {
+                let payload = serde_json::to_string(&ev.payload)
+                    .map_err(|_| StoreError::InvalidStoredJson)?;
+                tx.execute(
+                    "INSERT INTO cognitive_events (id, investigation_id, cycle, timestamp, event_type, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        ev.id,
+                        ev.investigation_id,
+                        ev.cycle,
+                        ev.timestamp,
+                        ev.event_type.as_str(),
+                        payload
+                    ],
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -606,6 +645,7 @@ mod tests {
                 max_actions: 20,
                 timeout: Duration::from_secs(10),
                 working_memory_capacity: 10,
+                max_concurrency: 1,
             },
         );
 
@@ -746,6 +786,7 @@ mod tests {
                 max_actions: 10,
                 timeout: Duration::from_secs(5),
                 working_memory_capacity: 10,
+                max_concurrency: 1,
             },
         );
 
@@ -768,5 +809,149 @@ mod tests {
             resumed_controller.state.context.current_stage,
             "trajectory_verified"
         );
+    }
+
+    #[tokio::test]
+    async fn test_atomic_persistence_and_transaction_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("atomic_tx.sqlite3");
+        let (store, _) = Store::initialize(db_path.clone()).unwrap();
+
+        let inv_id = "inv-tx-rollback".to_string();
+        let mut initial_state = crate::cognition::CognitiveState::new(
+            inv_id.clone(),
+            "Initial Objective",
+            10,
+            20,
+        );
+        initial_state.context.current_stage = "stage_initial".into();
+
+        // 1. Durably persist initial state
+        store
+            .persist_cognitive_snapshot_and_events(inv_id.clone(), &initial_state, vec![])
+            .await
+            .unwrap();
+
+        let loaded = store.get_cognitive_state(inv_id.clone()).await.unwrap().unwrap();
+        assert_eq!(loaded.context.current_stage, "stage_initial");
+
+        // 2. Perform an atomic transaction that fails mid-flight
+        // We open connection and execute a transaction that modifies state and then rolls back
+        let mut conn = open_connection(&db_path).unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let mut mutated_state = initial_state.clone();
+        mutated_state.context.current_stage = "stage_should_rollback".into();
+        let state_json = serde_json::to_string(&mutated_state).unwrap();
+
+        tx.execute(
+            "UPDATE investigations SET cognitive_state_json=?1 WHERE id=?2",
+            params![state_json, inv_id],
+        )
+        .unwrap();
+
+        tx.execute(
+            "INSERT INTO cognitive_events (id, investigation_id, cycle, timestamp, event_type, payload_json)
+             VALUES (?1, ?2, 1, '2026-11-17T00:00:00Z', 'state_updated', '{}')",
+            params!["ev-rollback-1", inv_id],
+        )
+        .unwrap();
+
+        // Deliberately roll back the transaction
+        tx.rollback().unwrap();
+
+        // 3. Verify state and event log remain unmodified (atomic rollback)
+        let after_rollback_state = store.get_cognitive_state(inv_id.clone()).await.unwrap().unwrap();
+        assert_eq!(
+            after_rollback_state.context.current_stage,
+            "stage_initial",
+            "State must remain 'stage_initial' after transaction rollback"
+        );
+
+        let events = store.get_cognitive_events(inv_id).await.unwrap();
+        assert!(events.is_empty(), "No events should exist after transaction rollback");
+    }
+
+    #[tokio::test]
+    async fn test_runtime_persistence_failure_retains_pending_events() {
+        use crate::cognition::{AsyncActionExecutor, CognitiveRuntime, ExecutiveConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        let valid_path = directory.path().join("runtime_persist.sqlite3");
+        let (store, _) = Store::initialize(valid_path).unwrap();
+
+        let inv_id = "inv-pending-events-test".to_string();
+        let state = crate::cognition::CognitiveState::new(
+            inv_id.clone(),
+            "Testing pending events retention",
+            10,
+            20,
+        );
+
+        let config = ExecutiveConfig {
+            max_cycles: 10,
+            max_actions: 10,
+            timeout: Duration::from_secs(5),
+            working_memory_capacity: 10,
+            max_concurrency: 1,
+        };
+
+        let executor = AsyncActionExecutor::for_testing();
+        let mut runtime = CognitiveRuntime::from_existing_state(
+            state,
+            config.clone(),
+            executor,
+            store.clone(),
+        );
+
+        // Emit 3 cognitive events into memory
+        runtime.controller.emit_event(
+            crate::cognition::CognitiveEventType::GoalCreated,
+            serde_json::json!({"test": 1}),
+        );
+        runtime.controller.emit_event(
+            crate::cognition::CognitiveEventType::ActionSelected,
+            serde_json::json!({"test": 2}),
+        );
+        runtime.controller.emit_event(
+            crate::cognition::CognitiveEventType::AttentionFocused,
+            serde_json::json!({"test": 3}),
+        );
+
+        assert_eq!(runtime.controller.events.len(), 3);
+
+        // Create a runtime with a broken store (pointing to a directory as a file path)
+        let broken_path = directory.path().to_path_buf(); // directory cannot be opened as SQLite file
+        let broken_store = Store { path: broken_path };
+
+        let mut broken_runtime = CognitiveRuntime::from_existing_state(
+            runtime.controller.state.clone(),
+            config,
+            AsyncActionExecutor::for_testing(),
+            broken_store,
+        );
+        broken_runtime.controller.events = runtime.controller.events.clone();
+
+        // Attempting to persist with broken store MUST return an error
+        let persist_res = broken_runtime.persist_state_and_events().await;
+        assert!(persist_res.is_err(), "Persistence should fail with broken store path");
+
+        // CRITICAL CHECK: Pending events must NOT be removed from memory on failure!
+        assert_eq!(
+            broken_runtime.controller.events.len(),
+            3,
+            "Pending events must be retained in memory when persistence fails"
+        );
+
+        // Now persist using the valid store: must succeed and clear memory
+        let persist_ok = runtime.persist_state_and_events().await;
+        assert!(persist_ok.is_ok(), "Persistence must succeed with valid store");
+        assert!(
+            runtime.controller.events.is_empty(),
+            "Pending events must only be cleared after durable SQLite commit"
+        );
+
+        let persisted_events = store.get_cognitive_events(inv_id).await.unwrap();
+        assert_eq!(persisted_events.len(), 3);
     }
 }

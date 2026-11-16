@@ -188,9 +188,9 @@ impl Orchestrator {
                 max_actions: 100,
                 timeout: Duration::from_secs(45),
                 working_memory_capacity: crate::cognition::DEFAULT_WORKING_MEMORY_CAPACITY,
+                max_concurrency: self.max_concurrency,
             };
 
-            let _ = self.max_concurrency;
             let mut runtime = crate::cognition::CognitiveRuntime::from_existing_state(
                 cs,
                 config,
@@ -198,7 +198,7 @@ impl Orchestrator {
                 self.store.clone(),
             );
 
-            let _ = runtime.run().await;
+            let runtime_run_result = runtime.run().await;
             let final_state = runtime.state().clone();
 
             // Reconstruct specialist reports in subproblem order
@@ -313,16 +313,33 @@ impl Orchestrator {
             record.model.usage = budget.usage();
             record.updated_at = timestamp();
 
-            if let Some(crate::cognition::StopReason::MetacognitiveAbort { rationale }) =
-                &final_state.executive.stop_reason
-            {
+            // 1. Runtime Error Propagation: A runtime failure must never result in Completed!
+            if let Err(runtime_err) = runtime_run_result {
                 record.status = InvestigationStatus::Failed;
-                record.error = Some(rationale.clone());
+                record.error = Some(runtime_err.clone());
                 let _ = self.store.save(&record).await;
-                return Err(rationale.clone());
+                return Err(runtime_err);
             }
 
-            record.status = InvestigationStatus::Completed;
+            // 2. Honest Terminal Status: Map every StopReason to an honest investigation outcome
+            let all_goals_terminal = !final_state.goals.goals.is_empty()
+                && final_state.goals.goals.values().all(|g| g.status.is_terminal());
+            let (status, err_opt) = map_stop_reason_to_investigation_outcome(
+                final_state.executive.stop_reason.as_ref(),
+                all_goals_terminal,
+            );
+            record.status = status;
+            if let Some(err) = err_opt {
+                record.error = Some(err);
+            }
+            if matches!(
+                final_state.executive.stop_reason,
+                Some(crate::cognition::StopReason::MetacognitiveAbort { .. })
+            ) {
+                let _ = self.store.save(&record).await;
+                return Err(record.error.clone().unwrap_or_else(|| "Metacognitive abort".into()));
+            }
+
             self.store.save(&record).await.map_err(|e| e.to_string())?;
             Ok(record.clone())
         }
@@ -427,6 +444,54 @@ fn validate_plan(plan: &InvestigationPlan) -> Result<(), String> {
         visit(&problem.id, plan, &mut visited, &mut pending)?;
     }
     Ok(())
+}
+
+/// Maps an executive StopReason to an honest InvestigationStatus and error message.
+/// Ensures budget exhaustion, timeout, cycle limit, deadlock, and cancellation never silently become Completed.
+pub fn map_stop_reason_to_investigation_outcome(
+    stop_reason: Option<&crate::cognition::StopReason>,
+    all_goals_terminal: bool,
+) -> (InvestigationStatus, Option<String>) {
+    match stop_reason {
+        Some(crate::cognition::StopReason::ObjectiveAchieved)
+        | Some(crate::cognition::StopReason::AllGoalsCompleted) => {
+            (InvestigationStatus::Completed, None)
+        }
+        Some(crate::cognition::StopReason::BudgetExhausted) => (
+            InvestigationStatus::Interrupted,
+            Some("Action budget exhausted before completing all goals".into()),
+        ),
+        Some(crate::cognition::StopReason::CycleLimitReached) => (
+            InvestigationStatus::Interrupted,
+            Some("Executive cycle limit reached before completing all goals".into()),
+        ),
+        Some(crate::cognition::StopReason::TimeoutExceeded) => (
+            InvestigationStatus::Interrupted,
+            Some("Executive timeout exceeded before completing all goals".into()),
+        ),
+        Some(crate::cognition::StopReason::DeadlockNoExecutableActions) => (
+            InvestigationStatus::Failed,
+            Some("Deadlock detected: no executable actions remain for uncompleted goals".into()),
+        ),
+        Some(crate::cognition::StopReason::MetacognitiveAbort { rationale }) => (
+            InvestigationStatus::Failed,
+            Some(rationale.clone()),
+        ),
+        Some(crate::cognition::StopReason::UserCancelled) => (
+            InvestigationStatus::Interrupted,
+            Some("Investigation cancelled by user".into()),
+        ),
+        None => {
+            if all_goals_terminal {
+                (InvestigationStatus::Completed, None)
+            } else {
+                (
+                    InvestigationStatus::Interrupted,
+                    Some("Investigation stopped unexpectedly before completing all goals".into()),
+                )
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1100,5 +1165,134 @@ mod tests {
                 .analysis
                 .contains("Dependency 'step-fail' failed")
         );
+    }
+
+    #[test]
+    fn test_every_terminal_stop_reason_maps_honestly() {
+        use crate::cognition::StopReason;
+
+        // 1. Genuine successful completions
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::ObjectiveAchieved),
+            true,
+        );
+        assert_eq!(s, InvestigationStatus::Completed);
+        assert!(e.is_none());
+
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::AllGoalsCompleted),
+            true,
+        );
+        assert_eq!(s, InvestigationStatus::Completed);
+        assert!(e.is_none());
+
+        // 2. Budget exhaustion -> Interrupted (NOT Completed)
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::BudgetExhausted),
+            false,
+        );
+        assert_eq!(s, InvestigationStatus::Interrupted);
+        assert!(e.unwrap().contains("budget exhausted"));
+
+        // 3. Cycle limit -> Interrupted (NOT Completed)
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::CycleLimitReached),
+            false,
+        );
+        assert_eq!(s, InvestigationStatus::Interrupted);
+        assert!(e.unwrap().contains("cycle limit reached"));
+
+        // 4. Timeout -> Interrupted (NOT Completed)
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::TimeoutExceeded),
+            false,
+        );
+        assert_eq!(s, InvestigationStatus::Interrupted);
+        assert!(e.unwrap().contains("timeout exceeded"));
+
+        // 5. Deadlock -> Failed (NOT Completed)
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::DeadlockNoExecutableActions),
+            false,
+        );
+        assert_eq!(s, InvestigationStatus::Failed);
+        assert!(e.unwrap().contains("Deadlock detected"));
+
+        // 6. Metacognitive abort -> Failed (NOT Completed)
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::MetacognitiveAbort {
+                rationale: "Unresolvable contradiction threshold breached".into(),
+            }),
+            false,
+        );
+        assert_eq!(s, InvestigationStatus::Failed);
+        assert!(e.unwrap().contains("contradiction"));
+
+        // 7. User cancellation -> Interrupted (NOT Completed)
+        let (s, e) = map_stop_reason_to_investigation_outcome(
+            Some(&StopReason::UserCancelled),
+            false,
+        );
+        assert_eq!(s, InvestigationStatus::Interrupted);
+        assert!(e.unwrap().contains("cancelled"));
+
+        // 8. None / unexpected stop with uncompleted goals -> Interrupted (NOT Completed)
+        let (s, e) = map_stop_reason_to_investigation_outcome(None, false);
+        assert_eq!(s, InvestigationStatus::Interrupted);
+        assert!(e.unwrap().contains("unexpectedly"));
+
+        // 9. None with all goals terminal -> Completed
+        let (s, e) = map_stop_reason_to_investigation_outcome(None, true);
+        assert_eq!(s, InvestigationStatus::Completed);
+        assert!(e.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_runtime_error_propagation_prevents_completed_status() {
+        struct FailingPlanProvider;
+        #[async_trait::async_trait]
+        impl ModelProvider for FailingPlanProvider {
+            async fn complete(
+                &self,
+                _req: GenerationRequest,
+                _budget: &RequestBudget,
+            ) -> Result<provider::ModelCompletion, provider::ModelError> {
+                Err(provider::ModelError::Http {
+                    status: 500,
+                    message: "Planning engine catastrophic failure".into(),
+                })
+            }
+            fn settings(&self) -> ProviderSettings {
+                ProviderSettings {
+                    model_provider: "fail".into(),
+                    model_name: Some("fail".into()),
+                    memory_provider: "sqlite",
+                    credentials_configured: true,
+                    max_tokens_per_request: 1000,
+                }
+            }
+            fn is_mock(&self) -> bool {
+                false
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _) = Store::initialize(directory.path().join("runtime_err.sqlite3")).unwrap();
+        let orchestration = Orchestrator {
+            store: store.clone(),
+            provider: Arc::new(FailingPlanProvider),
+            python: get_python_exe().into(),
+            worker_script: PathBuf::from("engine/app.py"),
+            worker_timeout: Duration::from_secs(5),
+            max_concurrency: 1,
+        };
+
+        let result = orchestration.investigate("Will this plan fail?".into()).await;
+        assert!(result.is_err(), "Runtime/provider failure must propagate as Err");
+
+        // Verify persisted record in SQLite is Failed, NOT Completed
+        let history = store.list(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
     }
 }

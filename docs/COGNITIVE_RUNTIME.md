@@ -124,3 +124,45 @@ The executive controller runs metacognitive monitoring on every discrete cycle:
 - **Consecutive Failure Detection**: If 3 consecutive actions fail, execution aborts with `StopReason::MetacognitiveAbort`.
 - **Sliding-Window Loop Detection**: Action fingerprints (`action_name:target_goal`) are tracked across a sliding window of size 6. If repeated identical actions are attempted, execution halts immediately with `StopReason::MetacognitiveAbort`.
 - **Failure Isolation**: Subproblem failures cleanly mark downstream dependencies as `Blocked` while allowing the overall investigation to complete via failure-tolerant `SynthesizeFindings`.
+
+---
+
+## 7. Milestone 1.3.2 Runtime Reliability & Epistemic Closures
+
+Milestone 1.3.2 addresses six critical operational findings from independent architectural reviews:
+
+### 7.1 Runtime Error Propagation & Honest Outcome Mapping
+- `src/orchestrator.rs` inspects the outcome of `runtime.run().await`. Runtime aborts and failures propagate immediately, marking the record as `InvestigationStatus::Failed`.
+- Introduced `InvestigationStatus::Interrupted` into `src/contracts.rs`.
+- `map_stop_reason_to_investigation_outcome` explicitly translates every `StopReason`:
+  - `ObjectiveAchieved` / `AllGoalsCompleted` $\to$ `InvestigationStatus::Completed`
+  - `BudgetExhausted` / `CycleLimitReached` / `TimeoutExceeded` / `UserCancelled` $\to$ `InvestigationStatus::Interrupted`
+  - `DeadlockNoExecutableActions` / `MetacognitiveAbort` $\to$ `InvestigationStatus::Failed`
+  - Incomplete state stops $\to$ `InvestigationStatus::Interrupted`
+- Resource exhaustion, timeout, or deadlock can never masquerade as successful completion.
+
+### 7.2 Atomic SQLite Persistence & Pending Event Retention
+- `Store::persist_cognitive_snapshot_and_events` executes the snapshot write and event log insertions inside a single atomic SQLite transaction (`tx`).
+- If an event insertion or disk operation fails, both snapshot and events roll back completely with zero database corruption.
+- Pending events in `CognitiveRuntime` are strictly preserved in memory on persistence error and are cleared only after a confirmed SQLite commit.
+
+### 7.3 Dynamic Specialist Provenance
+- Removed hardcoded `Specialist::Mathematics` default for tool executions.
+- `resolve_specialist_for_tool_execution` resolves the initiating scientific specialist dynamically from goal completion criteria, goal descriptions, parent goals, linked specialist reports, and tool allowlists.
+- Provenance attributes the real specialist domain (e.g. `Specialist::Physics` for projectile ballistics).
+
+### 7.4 Bounded Concurrency Scheduling & State Merging
+- Bounded parallel execution is preserved via `max_concurrency` while upholding executive control invariants:
+  - `ExecutiveController::get_concurrent_ready_actions` schedules ready actions for distinct active subproblems with zero mutual dependencies.
+  - Subproblems execute concurrently using Tokio `JoinSet`.
+  - Mutated state (knowledge items, working memory items, and contradictions) is collected and merged sequentially into the authoritative controller state, ensuring that goal completions and dependency transitions remain fully consistent and deterministic.
+
+### 7.5 Rigorous Contradiction Arbitration & Comparability Checks
+- A verified calculation is not automatically treated as proof that an entire contradiction is resolved.
+- `check_contradiction_comparability` verifies:
+  1. Tool identity: Matching tools/scientific procedures.
+  2. Condition identity: Parameter closeness within numerical tolerance $10^{-4}$.
+  3. Unit compatibility: Incompatible unit strings (e.g. meters vs feet) prevent automated resolution.
+  4. Assumption compatibility: Conflicting physical assumptions (e.g. ideal vacuum vs air drag) prevent automated resolution.
+- Ambiguous contradictions or cases with multiple conflicting verified items route to `ResolutionOutcome::RequiresHumanReview` with `resolved = false` and `ActionExecutionStatus::Uncertain`.
+

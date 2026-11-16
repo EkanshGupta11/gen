@@ -22,6 +22,17 @@ impl Specialist {
         }
     }
 
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "mathematics" | "math" => Some(Self::Mathematics),
+            "physics" => Some(Self::Physics),
+            "chemistry" => Some(Self::Chemistry),
+            "biology" => Some(Self::Biology),
+            "medicinal_science" | "medicinal" => Some(Self::MedicinalScience),
+            _ => None,
+        }
+    }
+
     pub fn allowed_tools(&self) -> &'static [&'static str] {
         match self {
             Self::Mathematics => &[
@@ -67,6 +78,13 @@ impl Specialist {
     }
 }
 
+impl std::str::FromStr for Specialist {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_str(s).ok_or_else(|| format!("Unknown specialist: {s}"))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvestigationStatus {
@@ -75,6 +93,7 @@ pub enum InvestigationStatus {
     Synthesizing,
     Completed,
     Failed,
+    Interrupted,
 }
 
 impl InvestigationStatus {
@@ -85,6 +104,7 @@ impl InvestigationStatus {
             Self::Synthesizing => "synthesizing",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
         }
     }
 }

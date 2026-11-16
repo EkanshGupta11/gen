@@ -269,3 +269,117 @@ impl CognitiveState {
             || self.executive.current_phase == ExecutivePhase::Stopped
     }
 }
+
+/// Checks whether a verified knowledge item is scientifically comparable to another conflicting item.
+/// Returns Ok(()) if the items share matching tools/topics, compatible conditions/arguments,
+/// compatible units, and non-conflicting physical/model assumptions.
+pub fn check_contradiction_comparability(
+    verified: &KnowledgeItem,
+    other: &KnowledgeItem,
+) -> Result<(), String> {
+    // 1. Tool check: If both specify a tool, ensure they match
+    let tool_v = verified.content.get("tool").and_then(Value::as_str);
+    let tool_o = other.content.get("tool").and_then(Value::as_str);
+    if let (Some(tv), Some(to)) = (tool_v, tool_o)
+        && tv != to
+    {
+        return Err(format!("Different tools used: '{tv}' vs '{to}'"));
+    }
+
+    // 2. Condition / Parameter comparison
+    let args_v = verified.content.get("arguments").and_then(Value::as_object);
+    let args_o = other.content.get("arguments").and_then(Value::as_object);
+    if let (Some(av), Some(ao)) = (args_v, args_o) {
+        for (k, val_v) in av {
+            if let Some(val_o) = ao.get(k) {
+                if let (Some(nv), Some(no)) = (val_v.as_f64(), val_o.as_f64()) {
+                    if (nv - no).abs() > 1e-4 {
+                        return Err(format!(
+                            "Condition parameter mismatch for '{k}': {nv} vs {no}"
+                        ));
+                    }
+                } else if val_v != val_o {
+                    return Err(format!(
+                        "Condition parameter mismatch for '{k}': {:?} vs {:?}",
+                        val_v, val_o
+                    ));
+                }
+            }
+        }
+    }
+
+    // 3. Units comparison
+    let unit_v = verified
+        .content
+        .get("units")
+        .or_else(|| verified.content.get("unit"));
+    let unit_o = other
+        .content
+        .get("units")
+        .or_else(|| other.content.get("unit"));
+    if let (Some(uv), Some(uo)) = (unit_v, unit_o)
+        && uv != uo
+    {
+        return Err(format!("Incompatible units: {:?} vs {:?}", uv, uo));
+    }
+
+    if let (Some(av), Some(ao)) = (args_v, args_o) {
+        let u_v = av.get("units").or_else(|| av.get("unit"));
+        let u_o = ao.get("units").or_else(|| ao.get("unit"));
+        if let (Some(uv), Some(uo)) = (u_v, u_o)
+            && uv != uo
+        {
+            return Err(format!(
+                "Incompatible units in arguments: {:?} vs {:?}",
+                uv, uo
+            ));
+        }
+    }
+
+    // 4. Assumptions comparison
+    let assumptions_v = extract_assumptions(&verified.content);
+    let assumptions_o = extract_assumptions(&other.content);
+
+    let v_has_air = assumptions_v
+        .iter()
+        .any(|a| a.contains("air") || a.contains("drag") || a.contains("resistance"));
+    let o_has_air = assumptions_o
+        .iter()
+        .any(|a| a.contains("air") || a.contains("drag") || a.contains("resistance"));
+    let v_has_vacuum = assumptions_v
+        .iter()
+        .any(|a| a.contains("vacuum") || a.contains("ideal") || a.contains("no drag"));
+    let o_has_vacuum = assumptions_o
+        .iter()
+        .any(|a| a.contains("vacuum") || a.contains("ideal") || a.contains("no drag"));
+
+    if (v_has_air && o_has_vacuum) || (v_has_vacuum && o_has_air) {
+        return Err("Conflicting physical assumptions: air resistance vs ideal vacuum".into());
+    }
+
+    for a_v in &assumptions_v {
+        for a_o in &assumptions_o {
+            if (a_v.contains("relativistic") && a_o.contains("classical"))
+                || (a_v.contains("classical") && a_o.contains("relativistic"))
+            {
+                return Err(format!("Conflicting model assumptions: '{a_v}' vs '{a_o}'"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_assumptions(val: &Value) -> Vec<String> {
+    let mut assumptions = Vec::new();
+    if let Some(arr) = val.get("assumptions").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                assumptions.push(s.to_lowercase());
+            }
+        }
+    } else if let Some(s) = val.get("assumptions").and_then(Value::as_str) {
+        assumptions.push(s.to_lowercase());
+    }
+    assumptions
+}

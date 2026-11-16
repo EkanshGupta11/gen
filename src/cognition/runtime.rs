@@ -77,6 +77,55 @@ impl CognitiveRuntime {
             return Ok(false);
         }
 
+        // Bounded concurrency check: if multiple independent actions are ready and concurrency > 1,
+        // execute them concurrently across worker tasks and commit their outcomes sequentially.
+        if self.controller.config.max_concurrency > 1 {
+            let batch = self
+                .controller
+                .get_concurrent_ready_actions(self.controller.config.max_concurrency);
+            if batch.len() > 1 {
+                self.controller.state.executive.current_phase = ExecutivePhase::ExecuteAction;
+                let mut join_set = tokio::task::JoinSet::new();
+                for action in batch {
+                    let exec = self.executor.clone();
+                    let act = action.clone();
+                    let mut state_clone = self.controller.state.clone();
+                    join_set.spawn(async move {
+                        let outcome = exec.execute(&act, &mut state_clone).await;
+                        (act, outcome, state_clone)
+                    });
+                }
+                while let Some(res) = join_set.join_next().await {
+                    match res {
+                        Ok((act, outcome, task_state)) => {
+                            // Durably merge any knowledge items produced by the concurrent task
+                            for (id, item) in task_state.knowledge_items {
+                                if !self.controller.state.knowledge_items.contains_key(&id) {
+                                    self.controller.state.add_knowledge_item(item);
+                                }
+                            }
+                            // Merge any new contradictions detected during the task
+                            for contradiction in task_state.contradictions {
+                                if !self
+                                    .controller
+                                    .state
+                                    .contradictions
+                                    .iter()
+                                    .any(|c| c.id == contradiction.id)
+                                {
+                                    self.controller.state.contradictions.push(contradiction);
+                                }
+                            }
+                            self.controller.step_commit(&act, outcome)?;
+                        }
+                        Err(e) => return Err(format!("Concurrent action task failed: {e}")),
+                    }
+                }
+                self.persist_state_and_events().await?;
+                return Ok(!self.controller.state.is_stopped());
+            }
+        }
+
         match self.controller.step_prepare()? {
             Some(action) => {
                 self.controller.state.executive.current_phase = ExecutivePhase::ExecuteAction;
@@ -96,7 +145,7 @@ impl CognitiveRuntime {
     }
 
     /// Run the runtime until the investigation completes, stops, or hits limits.
-    pub async fn run(&mut self) -> Result<&CognitiveState, String> {
+    pub async fn run(&mut self) -> Result<(), String> {
         while !self.controller.state.is_stopped() {
             let continue_exec = self.step().await?;
             if !continue_exec {
@@ -104,19 +153,23 @@ impl CognitiveRuntime {
             }
         }
         self.persist_state_and_events().await?;
-        Ok(&self.controller.state)
+        Ok(())
     }
 
     /// Atomically persist cognitive state snapshot and any new cognitive events to SQLite.
     pub async fn persist_state_and_events(&mut self) -> Result<(), String> {
-        let events = std::mem::take(&mut self.controller.events);
-        if !events.is_empty() {
-            let _ = self.store.append_cognitive_events(events).await;
-        }
+        let pending_events = self.controller.events.clone();
         self.store
-            .save_cognitive_state(self.investigation_id.clone(), &self.controller.state)
+            .persist_cognitive_snapshot_and_events(
+                self.investigation_id.clone(),
+                &self.controller.state,
+                pending_events,
+            )
             .await
             .map_err(|e| e.to_string())?;
+
+        // Durably committed to SQLite: safely clear pending events from memory
+        self.controller.events.clear();
         Ok(())
     }
 
