@@ -273,72 +273,120 @@ impl CognitiveState {
 /// Checks whether a verified knowledge item is scientifically comparable to another conflicting item.
 /// Returns Ok(()) if the items share matching tools/topics, compatible conditions/arguments,
 /// compatible units, and non-conflicting physical/model assumptions.
+///
+/// FAILS CLOSED: Missing units, assumptions, arguments, conditions, or mismatched result fields
+/// must NOT count as compatible.
 pub fn check_contradiction_comparability(
     verified: &KnowledgeItem,
     other: &KnowledgeItem,
 ) -> Result<(), String> {
-    // 1. Tool check: If both specify a tool, ensure they match
-    let tool_v = verified.content.get("tool").and_then(Value::as_str);
-    let tool_o = other.content.get("tool").and_then(Value::as_str);
-    if let (Some(tv), Some(to)) = (tool_v, tool_o)
-        && tv != to
-    {
-        return Err(format!("Different tools used: '{tv}' vs '{to}'"));
+    // 1. Tool check: Both MUST specify a tool/operation, and they must match
+    let tool_v = verified
+        .content
+        .get("tool")
+        .and_then(Value::as_str)
+        .or(verified.provenance.source_id.as_deref());
+    let tool_o = other
+        .content
+        .get("tool")
+        .and_then(Value::as_str)
+        .or(other.provenance.source_id.as_deref());
+
+    match (tool_v, tool_o) {
+        (Some(tv), Some(to)) => {
+            if tv != to {
+                return Err(format!("Different tools used: '{tv}' vs '{to}'"));
+            }
+        }
+        (None, _) | (_, None) => {
+            return Err("Tool or scientific operation specification missing in evidence".into());
+        }
     }
 
-    // 2. Condition / Parameter comparison
-    let args_v = verified.content.get("arguments").and_then(Value::as_object);
-    let args_o = other.content.get("arguments").and_then(Value::as_object);
-    if let (Some(av), Some(ao)) = (args_v, args_o) {
-        for (k, val_v) in av {
-            if let Some(val_o) = ao.get(k) {
-                if let (Some(nv), Some(no)) = (val_v.as_f64(), val_o.as_f64()) {
-                    if (nv - no).abs() > 1e-4 {
+    // 2. Condition / Parameter comparison: Both MUST specify arguments/parameters
+    let args_v = verified
+        .content
+        .get("arguments")
+        .or_else(|| verified.content.get("parameters"))
+        .and_then(Value::as_object);
+    let args_o = other
+        .content
+        .get("arguments")
+        .or_else(|| other.content.get("parameters"))
+        .and_then(Value::as_object);
+
+    match (args_v, args_o) {
+        (Some(av), Some(ao)) => {
+            // Verify that parameters match
+            for (k, val_v) in av {
+                if k == "units" || k == "unit" {
+                    continue;
+                }
+                if let Some(val_o) = ao.get(k) {
+                    if let (Some(nv), Some(no)) = (val_v.as_f64(), val_o.as_f64()) {
+                        if (nv - no).abs() > 1e-4 {
+                            return Err(format!(
+                                "Condition parameter mismatch for '{k}': {nv} vs {no}"
+                            ));
+                        }
+                    } else if val_v != val_o {
                         return Err(format!(
-                            "Condition parameter mismatch for '{k}': {nv} vs {no}"
+                            "Condition parameter mismatch for '{k}': {:?} vs {:?}",
+                            val_v, val_o
                         ));
                     }
-                } else if val_v != val_o {
+                } else {
                     return Err(format!(
-                        "Condition parameter mismatch for '{k}': {:?} vs {:?}",
-                        val_v, val_o
+                        "Mismatched condition parameters: parameter '{k}' missing from conflicting item"
+                    ));
+                }
+            }
+            for k in ao.keys() {
+                if k == "units" || k == "unit" {
+                    continue;
+                }
+                if !av.contains_key(k) {
+                    return Err(format!(
+                        "Mismatched condition parameters: parameter '{k}' missing from verified item"
                     ));
                 }
             }
         }
-    }
-
-    // 3. Units comparison
-    let unit_v = verified
-        .content
-        .get("units")
-        .or_else(|| verified.content.get("unit"));
-    let unit_o = other
-        .content
-        .get("units")
-        .or_else(|| other.content.get("unit"));
-    if let (Some(uv), Some(uo)) = (unit_v, unit_o)
-        && uv != uo
-    {
-        return Err(format!("Incompatible units: {:?} vs {:?}", uv, uo));
-    }
-
-    if let (Some(av), Some(ao)) = (args_v, args_o) {
-        let u_v = av.get("units").or_else(|| av.get("unit"));
-        let u_o = ao.get("units").or_else(|| ao.get("unit"));
-        if let (Some(uv), Some(uo)) = (u_v, u_o)
-            && uv != uo
-        {
-            return Err(format!(
-                "Incompatible units in arguments: {:?} vs {:?}",
-                uv, uo
-            ));
+        (None, _) | (_, None) => {
+            return Err("Condition parameters/arguments missing in evidence".into());
         }
     }
 
-    // 4. Assumptions comparison
+    // 3. Units comparison: Both MUST specify units, and units must match
+    let unit_v = verified
+        .content
+        .get("units")
+        .or_else(|| verified.content.get("unit"))
+        .or_else(|| args_v.and_then(|a| a.get("units").or_else(|| a.get("unit"))));
+    let unit_o = other
+        .content
+        .get("units")
+        .or_else(|| other.content.get("unit"))
+        .or_else(|| args_o.and_then(|a| a.get("units").or_else(|| a.get("unit"))));
+
+    match (unit_v, unit_o) {
+        (Some(uv), Some(uo)) => {
+            if uv != uo {
+                return Err(format!("Incompatible units: {:?} vs {:?}", uv, uo));
+            }
+        }
+        (None, _) | (_, None) => {
+            return Err("Units specification missing in evidence".into());
+        }
+    }
+
+    // 4. Assumptions comparison: Both MUST specify explicit assumptions, and they must not conflict
     let assumptions_v = extract_assumptions(&verified.content);
     let assumptions_o = extract_assumptions(&other.content);
+
+    if assumptions_v.is_empty() || assumptions_o.is_empty() {
+        return Err("Explicit scientific assumptions missing in evidence".into());
+    }
 
     let v_has_air = assumptions_v
         .iter()
@@ -359,11 +407,39 @@ pub fn check_contradiction_comparability(
 
     for a_v in &assumptions_v {
         for a_o in &assumptions_o {
-            if (a_v.contains("relativistic") && a_o.contains("classical"))
-                || (a_v.contains("classical") && a_o.contains("relativistic"))
+            if (a_v.contains("relativ") && a_o.contains("classical"))
+                || (a_v.contains("classical") && a_o.contains("relativ"))
             {
                 return Err(format!("Conflicting model assumptions: '{a_v}' vs '{a_o}'"));
             }
+            if (a_v.contains("isothermal") && a_o.contains("adiabatic"))
+                || (a_v.contains("adiabatic") && a_o.contains("isothermal"))
+            {
+                return Err(format!(
+                    "Conflicting thermodynamic assumptions: '{a_v}' vs '{a_o}'"
+                ));
+            }
+            if (a_v.contains("laminar") && a_o.contains("turbulent"))
+                || (a_v.contains("turbulent") && a_o.contains("laminar"))
+            {
+                return Err(format!("Conflicting fluid assumptions: '{a_v}' vs '{a_o}'"));
+            }
+        }
+    }
+
+    // 5. Result field check: Both MUST have a result/output value
+    let res_v = verified
+        .content
+        .get("result")
+        .or_else(|| verified.content.get("value"));
+    let res_o = other
+        .content
+        .get("result")
+        .or_else(|| other.content.get("value"));
+    match (res_v, res_o) {
+        (Some(_), Some(_)) => {}
+        (None, _) | (_, None) => {
+            return Err("Output result field missing in evidence".into());
         }
     }
 

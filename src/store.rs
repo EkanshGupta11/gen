@@ -818,12 +818,8 @@ mod tests {
         let (store, _) = Store::initialize(db_path.clone()).unwrap();
 
         let inv_id = "inv-tx-rollback".to_string();
-        let mut initial_state = crate::cognition::CognitiveState::new(
-            inv_id.clone(),
-            "Initial Objective",
-            10,
-            20,
-        );
+        let mut initial_state =
+            crate::cognition::CognitiveState::new(inv_id.clone(), "Initial Objective", 10, 20);
         initial_state.context.current_stage = "stage_initial".into();
 
         // 1. Durably persist initial state
@@ -832,44 +828,90 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store.get_cognitive_state(inv_id.clone()).await.unwrap().unwrap();
+        let loaded = store
+            .get_cognitive_state(inv_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.context.current_stage, "stage_initial");
 
-        // 2. Perform an atomic transaction that fails mid-flight
-        // We open connection and execute a transaction that modifies state and then rolls back
-        let mut conn = open_connection(&db_path).unwrap();
-        let tx = conn.transaction().unwrap();
+        // 2. Install a controlled SQLite trigger that aborts during event insertion
+        // This exercises real failure and rollback inside persist_cognitive_snapshot_and_events
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TRIGGER abort_event_insert
+                 BEFORE INSERT ON cognitive_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'controlled database failure during event insertion');
+                 END;",
+                [],
+            )
+            .unwrap();
+        }
 
         let mut mutated_state = initial_state.clone();
         mutated_state.context.current_stage = "stage_should_rollback".into();
-        let state_json = serde_json::to_string(&mutated_state).unwrap();
-
-        tx.execute(
-            "UPDATE investigations SET cognitive_state_json=?1 WHERE id=?2",
-            params![state_json, inv_id],
-        )
-        .unwrap();
-
-        tx.execute(
-            "INSERT INTO cognitive_events (id, investigation_id, cycle, timestamp, event_type, payload_json)
-             VALUES (?1, ?2, 1, '2026-11-17T00:00:00Z', 'state_updated', '{}')",
-            params!["ev-rollback-1", inv_id],
-        )
-        .unwrap();
-
-        // Deliberately roll back the transaction
-        tx.rollback().unwrap();
-
-        // 3. Verify state and event log remain unmodified (atomic rollback)
-        let after_rollback_state = store.get_cognitive_state(inv_id.clone()).await.unwrap().unwrap();
-        assert_eq!(
-            after_rollback_state.context.current_stage,
-            "stage_initial",
-            "State must remain 'stage_initial' after transaction rollback"
+        let event = crate::cognition::CognitiveEvent::new(
+            inv_id.clone(),
+            1,
+            crate::cognition::CognitiveEventType::StateUpdated,
+            serde_json::json!({"action": "mutated"}),
         );
 
-        let events = store.get_cognitive_events(inv_id).await.unwrap();
-        assert!(events.is_empty(), "No events should exist after transaction rollback");
+        let persist_result = store
+            .persist_cognitive_snapshot_and_events(
+                inv_id.clone(),
+                &mutated_state,
+                vec![event.clone()],
+            )
+            .await;
+        assert!(
+            persist_result.is_err(),
+            "Transaction must fail when event insertion aborts"
+        );
+        let err_msg = persist_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("controlled database failure during event insertion"),
+            "Error must surface trigger abort: {err_msg}"
+        );
+
+        // 3. Verify state and event log remain unmodified (atomic rollback)
+        let after_rollback_state = store
+            .get_cognitive_state(inv_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_rollback_state.context.current_stage, "stage_initial",
+            "State snapshot update must be rolled back to 'stage_initial'"
+        );
+
+        let events = store.get_cognitive_events(inv_id.clone()).await.unwrap();
+        assert!(
+            events.is_empty(),
+            "Zero events must exist in table after transaction rollback"
+        );
+
+        // 4. Drop trigger and verify subsequent persistence succeeds
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("DROP TRIGGER abort_event_insert;", [])
+                .unwrap();
+        }
+
+        store
+            .persist_cognitive_snapshot_and_events(inv_id.clone(), &mutated_state, vec![event])
+            .await
+            .unwrap();
+        let final_state = store
+            .get_cognitive_state(inv_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_state.context.current_stage, "stage_should_rollback");
+        let final_events = store.get_cognitive_events(inv_id).await.unwrap();
+        assert_eq!(final_events.len(), 1);
     }
 
     #[tokio::test]
@@ -897,12 +939,8 @@ mod tests {
         };
 
         let executor = AsyncActionExecutor::for_testing();
-        let mut runtime = CognitiveRuntime::from_existing_state(
-            state,
-            config.clone(),
-            executor,
-            store.clone(),
-        );
+        let mut runtime =
+            CognitiveRuntime::from_existing_state(state, config.clone(), executor, store.clone());
 
         // Emit 3 cognitive events into memory
         runtime.controller.emit_event(
@@ -934,7 +972,10 @@ mod tests {
 
         // Attempting to persist with broken store MUST return an error
         let persist_res = broken_runtime.persist_state_and_events().await;
-        assert!(persist_res.is_err(), "Persistence should fail with broken store path");
+        assert!(
+            persist_res.is_err(),
+            "Persistence should fail with broken store path"
+        );
 
         // CRITICAL CHECK: Pending events must NOT be removed from memory on failure!
         assert_eq!(
@@ -945,7 +986,10 @@ mod tests {
 
         // Now persist using the valid store: must succeed and clear memory
         let persist_ok = runtime.persist_state_and_events().await;
-        assert!(persist_ok.is_ok(), "Persistence must succeed with valid store");
+        assert!(
+            persist_ok.is_ok(),
+            "Persistence must succeed with valid store"
+        );
         assert!(
             runtime.controller.events.is_empty(),
             "Pending events must only be cleared after durable SQLite commit"

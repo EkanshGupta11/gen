@@ -77,71 +77,84 @@ impl CognitiveRuntime {
             return Ok(false);
         }
 
-        // Bounded concurrency check: if multiple independent actions are ready and concurrency > 1,
-        // execute them concurrently across worker tasks and commit their outcomes sequentially.
-        if self.controller.config.max_concurrency > 1 {
-            let batch = self
-                .controller
-                .get_concurrent_ready_actions(self.controller.config.max_concurrency);
-            if batch.len() > 1 {
-                self.controller.state.executive.current_phase = ExecutivePhase::ExecuteAction;
-                let mut join_set = tokio::task::JoinSet::new();
-                for action in batch {
-                    let exec = self.executor.clone();
-                    let act = action.clone();
-                    let mut state_clone = self.controller.state.clone();
-                    join_set.spawn(async move {
-                        let outcome = exec.execute(&act, &mut state_clone).await;
-                        (act, outcome, state_clone)
-                    });
-                }
-                while let Some(res) = join_set.join_next().await {
-                    match res {
-                        Ok((act, outcome, task_state)) => {
-                            // Durably merge any knowledge items produced by the concurrent task
-                            for (id, item) in task_state.knowledge_items {
-                                if !self.controller.state.knowledge_items.contains_key(&id) {
-                                    self.controller.state.add_knowledge_item(item);
-                                }
-                            }
-                            // Merge any new contradictions detected during the task
-                            for contradiction in task_state.contradictions {
-                                if !self
-                                    .controller
-                                    .state
-                                    .contradictions
-                                    .iter()
-                                    .any(|c| c.id == contradiction.id)
-                                {
-                                    self.controller.state.contradictions.push(contradiction);
-                                }
-                            }
-                            self.controller.step_commit(&act, outcome)?;
-                        }
-                        Err(e) => return Err(format!("Concurrent action task failed: {e}")),
-                    }
-                }
-                self.persist_state_and_events().await?;
-                return Ok(!self.controller.state.is_stopped());
-            }
+        // Authoritative executive control lifecycle: prepares single action or concurrent batch
+        let batch = self
+            .controller
+            .step_prepare_batch(self.controller.config.max_concurrency)?;
+
+        if batch.is_empty() {
+            self.persist_state_and_events().await?;
+            return Ok(!self.controller.state.is_stopped());
         }
 
-        match self.controller.step_prepare()? {
-            Some(action) => {
-                self.controller.state.executive.current_phase = ExecutivePhase::ExecuteAction;
-                let outcome = self
-                    .executor
-                    .execute(&action, &mut self.controller.state)
-                    .await;
-                self.controller.step_commit(&action, outcome)?;
-                self.persist_state_and_events().await?;
-                Ok(!self.controller.state.is_stopped())
-            }
-            None => {
-                self.persist_state_and_events().await?;
-                Ok(!self.controller.state.is_stopped())
+        if batch.len() == 1 {
+            let action = batch.into_iter().next().unwrap();
+            self.controller.state.executive.current_phase = ExecutivePhase::ExecuteAction;
+            let outcome = self
+                .executor
+                .execute(&action, &mut self.controller.state)
+                .await;
+            self.controller.step_commit(&action, outcome)?;
+            self.persist_state_and_events().await?;
+            return Ok(!self.controller.state.is_stopped());
+        }
+
+        // Bounded concurrent execution across worker tasks
+        self.controller.state.executive.current_phase = ExecutivePhase::ExecuteAction;
+        let mut join_set = tokio::task::JoinSet::new();
+        for action in batch {
+            let exec = self.executor.clone();
+            let act = action.clone();
+            let mut state_clone = self.controller.state.clone();
+            join_set.spawn(async move {
+                let outcome = exec.execute(&act, &mut state_clone).await;
+                (act, outcome, state_clone)
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok((act, outcome, task_state)) => {
+                    let target_goal = act.associated_goal_id().map(|s| s.to_string());
+                    // Durably merge any knowledge items produced by the concurrent task scoped strictly to the target goal
+                    for (id, item) in task_state.knowledge_items {
+                        if !self.controller.state.knowledge_items.contains_key(&id) {
+                            let belongs_to_goal = match &target_goal {
+                                Some(gid) => item.related_goals.contains(gid),
+                                None => true,
+                            };
+                            if belongs_to_goal {
+                                self.controller.state.add_knowledge_item(item);
+                            }
+                        }
+                    }
+                    // Sync goal failure if worker task recorded a failed status for its target goal
+                    if let Some(ref gid) = target_goal
+                        && let Some(task_goal) = task_state.goals.get_goal(gid)
+                        && task_goal.status == crate::cognition::GoalStatus::Failed
+                        && let Some(auth_goal) = self.controller.state.goals.get_goal_mut(gid)
+                    {
+                        auth_goal.status = crate::cognition::GoalStatus::Failed;
+                    }
+                    // Merge any new contradictions detected during the task
+                    for contradiction in task_state.contradictions {
+                        if !self
+                            .controller
+                            .state
+                            .contradictions
+                            .iter()
+                            .any(|c| c.id == contradiction.id)
+                        {
+                            self.controller.state.contradictions.push(contradiction);
+                        }
+                    }
+                    self.controller.step_commit(&act, outcome)?;
+                }
+                Err(e) => return Err(format!("Concurrent action task failed: {e}")),
             }
         }
+        self.persist_state_and_events().await?;
+        Ok(!self.controller.state.is_stopped())
     }
 
     /// Run the runtime until the investigation completes, stops, or hits limits.

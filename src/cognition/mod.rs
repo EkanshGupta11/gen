@@ -507,7 +507,13 @@ mod tests {
         let k_item_a = KnowledgeItem {
             id: "item-a".into(),
             item_type: KnowledgeItemType::Calculation,
-            content: json!({"tool": "projectile", "result": 38.33}),
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"v0": 20.0, "angle": 45.0},
+                "units": "meters",
+                "assumptions": ["ideal vacuum", "flat ground"],
+                "result": 38.33
+            }),
             provenance: Provenance::new("scientific_tool"),
             epistemic_status: EpistemicStatus::Verified,
             related_goals: vec![],
@@ -517,7 +523,13 @@ mod tests {
         let k_item_b = KnowledgeItem {
             id: "item-b".into(),
             item_type: KnowledgeItemType::Calculation,
-            content: json!({"tool": "projectile", "result": 999.0}),
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"v0": 20.0, "angle": 45.0},
+                "units": "meters",
+                "assumptions": ["ideal vacuum", "flat ground"],
+                "result": 999.0
+            }),
             provenance: Provenance::new("model_claim"),
             epistemic_status: EpistemicStatus::Contradicted,
             related_goals: vec![],
@@ -638,6 +650,7 @@ mod tests {
             content: json!({
                 "tool": "projectile",
                 "arguments": {"speed": 20.0, "angle_degrees": 35.0},
+                "units": "meters",
                 "assumptions": ["ideal vacuum", "no drag"],
                 "output": {"range_m": 38.33}
             }),
@@ -653,6 +666,7 @@ mod tests {
             content: json!({
                 "tool": "projectile",
                 "arguments": {"speed": 20.0, "angle_degrees": 35.0},
+                "units": "meters",
                 "assumptions": ["air resistance", "turbulent drag"],
                 "output": {"range_m": 29.50}
             }),
@@ -691,7 +705,13 @@ mod tests {
         let m_item = KnowledgeItem {
             id: "calc-meters".into(),
             item_type: KnowledgeItemType::Calculation,
-            content: json!({"tool": "projectile", "units": "meters", "output": {"range": 38.33}}),
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"speed": 20.0, "angle_degrees": 35.0},
+                "units": "meters",
+                "assumptions": ["ideal vacuum"],
+                "output": {"range": 38.33}
+            }),
             provenance: Provenance::new("scientific_tool").with_source_id("physics"),
             epistemic_status: EpistemicStatus::Verified,
             related_goals: vec![],
@@ -701,7 +721,13 @@ mod tests {
         let f_item = KnowledgeItem {
             id: "calc-feet".into(),
             item_type: KnowledgeItemType::Calculation,
-            content: json!({"tool": "projectile", "units": "feet", "output": {"range": 125.75}}),
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"speed": 20.0, "angle_degrees": 35.0},
+                "units": "feet",
+                "assumptions": ["ideal vacuum"],
+                "output": {"range": 125.75}
+            }),
             provenance: Provenance::new("specialist_report").with_source_id("physics"),
             epistemic_status: EpistemicStatus::Uncertain,
             related_goals: vec![],
@@ -913,6 +939,352 @@ mod tests {
         assert!(
             dependent_batch.is_empty(),
             "Actions with dependency conflicts must not be executed concurrently"
+        );
+    }
+
+    #[test]
+    fn test_contradiction_comparability_fails_closed_on_missing_or_mismatched_metadata() {
+        use crate::cognition::state::check_contradiction_comparability;
+
+        let base_verified = KnowledgeItem {
+            id: "v1".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({
+                "tool": "projectile",
+                "arguments": {"v0": 25.0, "angle": 45.0},
+                "units": "meters",
+                "assumptions": ["ideal vacuum", "flat ground"],
+                "result": 63.71
+            }),
+            provenance: Provenance::new("tool"),
+            epistemic_status: EpistemicStatus::Verified,
+            related_goals: vec![],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+
+        let mut other = base_verified.clone();
+        other.id = "o1".into();
+        other.content["result"] = json!(999.0);
+        assert!(
+            check_contradiction_comparability(&base_verified, &other).is_ok(),
+            "Exact condition match must be comparable"
+        );
+
+        // 1. Missing tool
+        let mut missing_tool = other.clone();
+        missing_tool.content.as_object_mut().unwrap().remove("tool");
+        let err = check_contradiction_comparability(&base_verified, &missing_tool).unwrap_err();
+        assert!(err.contains("Tool or scientific operation specification missing"));
+
+        // 2. Mismatched tool
+        let mut mismatched_tool = other.clone();
+        mismatched_tool.content["tool"] = json!("pendulum");
+        let err = check_contradiction_comparability(&base_verified, &mismatched_tool).unwrap_err();
+        assert!(err.contains("Different tools used"));
+
+        // 3. Missing arguments
+        let mut missing_args = other.clone();
+        missing_args
+            .content
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        let err = check_contradiction_comparability(&base_verified, &missing_args).unwrap_err();
+        assert!(err.contains("Condition parameters/arguments missing"));
+
+        // 4. Parameter value mismatch
+        let mut mismatched_param_val = other.clone();
+        mismatched_param_val.content["arguments"]["v0"] = json!(50.0);
+        let err =
+            check_contradiction_comparability(&base_verified, &mismatched_param_val).unwrap_err();
+        assert!(err.contains("Condition parameter mismatch for 'v0'"));
+
+        // 5. Parameter set mismatch
+        let mut mismatched_param_key = other.clone();
+        mismatched_param_key.content["arguments"] = json!({"v0": 25.0, "elevation": 10.0});
+        let err =
+            check_contradiction_comparability(&base_verified, &mismatched_param_key).unwrap_err();
+        assert!(err.contains("Mismatched condition parameters"));
+
+        // 6. Missing units
+        let mut missing_units = other.clone();
+        missing_units
+            .content
+            .as_object_mut()
+            .unwrap()
+            .remove("units");
+        let err = check_contradiction_comparability(&base_verified, &missing_units).unwrap_err();
+        assert!(err.contains("Units specification missing"));
+
+        // 7. Incompatible units
+        let mut mismatched_units = other.clone();
+        mismatched_units.content["units"] = json!("feet");
+        let err = check_contradiction_comparability(&base_verified, &mismatched_units).unwrap_err();
+        assert!(err.contains("Incompatible units"));
+
+        // 8. Missing assumptions
+        let mut missing_assumptions = other.clone();
+        missing_assumptions
+            .content
+            .as_object_mut()
+            .unwrap()
+            .remove("assumptions");
+        let err =
+            check_contradiction_comparability(&base_verified, &missing_assumptions).unwrap_err();
+        assert!(err.contains("Explicit scientific assumptions missing"));
+
+        // 9. Conflicting assumptions: air resistance vs vacuum
+        let mut drag_assumptions = other.clone();
+        drag_assumptions.content["assumptions"] = json!(["air drag", "viscous friction"]);
+        let err = check_contradiction_comparability(&base_verified, &drag_assumptions).unwrap_err();
+        assert!(err.contains("air resistance vs ideal vacuum"));
+
+        // 10. Conflicting assumptions: relativistic vs classical
+        let mut rel_v = base_verified.clone();
+        rel_v.content["assumptions"] = json!(["special relativity", "lorentz contraction"]);
+        let mut class_o = other.clone();
+        class_o.content["assumptions"] = json!(["classical mechanics", "galilean"]);
+        let err = check_contradiction_comparability(&rel_v, &class_o).unwrap_err();
+        assert!(err.contains("Conflicting model assumptions"));
+
+        // 11. Missing result
+        let mut missing_result = other.clone();
+        missing_result
+            .content
+            .as_object_mut()
+            .unwrap()
+            .remove("result");
+        let err = check_contradiction_comparability(&base_verified, &missing_result).unwrap_err();
+        assert!(err.contains("Output result field missing"));
+    }
+
+    #[test]
+    fn test_step_prepare_batch_enforces_authoritative_lifecycle_and_loop_detection() {
+        let mut controller = ExecutiveController::new(
+            "inv-batch-lifecycle",
+            "Test batch lifecycle",
+            ExecutiveConfig {
+                max_cycles: 5,
+                max_actions: 10,
+                timeout: std::time::Duration::from_secs(10),
+                working_memory_capacity: 10,
+                max_concurrency: 3,
+            },
+        );
+
+        // Budget reservation enforcement: remaining budget set to 2
+        controller.state.executive.remaining_action_budget = 2;
+
+        let make_goal = |id: &str, desc: &str| Goal {
+            id: id.into(),
+            description: desc.into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+
+        controller
+            .state
+            .goals
+            .add_goal(make_goal("g1", "Goal 1"))
+            .unwrap();
+        controller
+            .state
+            .goals
+            .add_goal(make_goal("g2", "Goal 2"))
+            .unwrap();
+        controller
+            .state
+            .goals
+            .add_goal(make_goal("g3", "Goal 3"))
+            .unwrap();
+
+        controller
+            .state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag1".into(),
+                goal_id: "g1".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: crate::contracts::Specialist::Physics,
+                    task: "T1".into(),
+                    goal_id: "g1".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+        controller
+            .state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag2".into(),
+                goal_id: "g2".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: crate::contracts::Specialist::Mathematics,
+                    task: "T2".into(),
+                    goal_id: "g2".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+        controller
+            .state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag3".into(),
+                goal_id: "g3".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: crate::contracts::Specialist::Chemistry,
+                    task: "T3".into(),
+                    goal_id: "g3".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+
+        // Batch capacity capped at remaining_action_budget (2), despite max_concurrency=3
+        let batch = controller.step_prepare_batch(3).unwrap();
+        assert_eq!(
+            batch.len(),
+            2,
+            "Batch must be clamped to remaining action budget of 2"
+        );
+
+        // Loop detection on batch actions: repeating the same action triggers MetacognitiveAbort
+        let repeating_action = batch[0].clone();
+        for _ in 0..4 {
+            let _ = controller
+                .loop_detector
+                .record_and_check_loop(&repeating_action);
+        }
+
+        let loop_result = controller.step_prepare_batch(3).unwrap();
+        assert!(loop_result.is_empty());
+        assert!(matches!(
+            controller.state.executive.stop_reason,
+            Some(StopReason::MetacognitiveAbort { .. })
+        ));
+    }
+
+    #[test]
+    fn test_cancelled_goal_semantics_prevent_false_completion() {
+        let mut controller = ExecutiveController::new(
+            "inv-cancel-semantics",
+            "Test honest cancellation",
+            ExecutiveConfig::default(),
+        );
+
+        let g1 = Goal {
+            id: "g1".into(),
+            description: "Cancelled goal".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Cancelled,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        let g2 = Goal {
+            id: "g2".into(),
+            description: "Completed goal".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Completed,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+
+        controller.state.goals.add_goal(g1).unwrap();
+        controller.state.goals.add_goal(g2).unwrap();
+
+        let batch = controller.step_prepare_batch(2).unwrap();
+        assert!(
+            batch.is_empty(),
+            "Terminal goals must produce empty prepare batch"
+        );
+        assert_eq!(
+            controller.state.executive.stop_reason,
+            Some(StopReason::UserCancelled),
+            "Partially cancelled goals must stop with UserCancelled, NEVER AllGoalsCompleted"
+        );
+    }
+
+    #[test]
+    fn test_failed_action_does_not_satisfy_another_goal() {
+        let mut controller = ExecutiveController::new(
+            "inv-goal-isolation",
+            "Test goal completion isolation",
+            ExecutiveConfig::default(),
+        );
+
+        let g1 = Goal {
+            id: "g1".into(),
+            description: "Physics goal".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::ToolExecuted {
+                tool_name: "projectile".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+
+        let g2 = Goal {
+            id: "g2".into(),
+            description: "Math goal".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::ToolExecuted {
+                tool_name: "arithmetic".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+
+        controller.state.goals.add_goal(g1).unwrap();
+        controller.state.goals.add_goal(g2).unwrap();
+
+        // Add a knowledge item strictly related to g1
+        let k_item = KnowledgeItem {
+            id: "calc-1".into(),
+            item_type: KnowledgeItemType::Calculation,
+            content: json!({"tool": "projectile", "result": 42.0}),
+            provenance: Provenance::new("tool"),
+            epistemic_status: EpistemicStatus::Verified,
+            related_goals: vec!["g1".into()],
+            related_entities: vec![],
+            timestamp: "2026-11-17T00:00:00Z".into(),
+        };
+        controller.state.add_knowledge_item(k_item);
+
+        controller.evaluate_goal_completions();
+
+        assert_eq!(
+            controller.state.goals.get_goal("g1").unwrap().status,
+            GoalStatus::Completed,
+            "Target goal g1 should be completed"
+        );
+        assert_eq!(
+            controller.state.goals.get_goal("g2").unwrap().status,
+            GoalStatus::Active,
+            "Unrelated goal g2 must NOT be satisfied by g1's tool execution"
         );
     }
 }

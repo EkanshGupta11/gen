@@ -166,3 +166,38 @@ Milestone 1.3.2 addresses six critical operational findings from independent arc
   4. Assumption compatibility: Conflicting physical assumptions (e.g. ideal vacuum vs air drag) prevent automated resolution.
 - Ambiguous contradictions or cases with multiple conflicting verified items route to `ResolutionOutcome::RequiresHumanReview` with `resolved = false` and `ActionExecutionStatus::Uncertain`.
 
+---
+
+## 8. Milestone 1.3.2.1 Executive Control Hardening & Live Model Validation
+
+Milestone 1.3.2.1 eliminates executive bypass vulnerabilities and hardens verification and persistence invariants:
+
+### 8.1 Authoritative Batch Preparation Lifecycle (`step_prepare_batch`)
+- All actions—including concurrent batches—route strictly through `ExecutiveController::step_prepare_batch(max_batch)`.
+- Enforces cycle limits, timeouts, and action budget bounds **before** any batch action is dispatched.
+- Action budget reservation: parallel batch capacity is strictly clamped to `max_batch.min(max_concurrency).min(remaining_action_budget)`.
+- Loop detection covers **every action** in the batch; repeated actions trigger immediate `MetacognitiveAbort`.
+- Precondition validation runs for every action in the batch before task spawning.
+- Bidirectional dependency validation prevents goals with mutual or sequential dependencies from entering the same batch.
+- Worker task mutation isolation: tasks execute on state clones, and only knowledge items strictly scoped to the task's target goal are merged into authoritative state upon completion.
+- Sequential authoritative state commits via `step_commit(&act, outcome)` preserve deterministic action accounting, loop history, and event streams.
+
+### 8.2 Fail-Closed Contradiction Comparability (`check_contradiction_comparability`)
+- Missing metadata fails closed: missing tools, missing arguments, missing units, missing explicit assumptions, or missing output result fields return `Err`.
+- Conflicting physical assumptions (vacuum vs air drag), model assumptions (relativistic vs classical), thermodynamic assumptions (isothermal vs adiabatic), or fluid assumptions (laminar vs turbulent) fail comparability.
+- Incomparable or ambiguous evidence routes to `ResolutionOutcome::RequiresHumanReview` with `resolved = false`.
+
+### 8.3 Cancelled-Goal Completion Semantics & Scoped Criteria
+- Cancelled goals never count as completed in all-goals-complete logic.
+- Partial or full cancellation maps to `StopReason::UserCancelled` $\to$ `InvestigationStatus::Interrupted`.
+- Goal completion criteria are strictly scoped to the target goal: tools executed for Goal A cannot satisfy completion criteria for Goal B.
+
+### 8.4 Failure-Persistence Error Surfacing
+- Every store failure when persisting error records is surfaced alongside the primary error, eliminating swallowed persistence errors.
+
+### 8.5 Live Gemini Provider Integration
+- Validated Google Gemini OpenAI-compatible endpoint compatibility (`https://generativelanguage.googleapis.com/v1beta/openai/`).
+- Documented model catalog availability (`models/gemini-3.8-flash`, `models/gemini-flash-latest`) and upstream cloud demand responses (HTTP 503 / timeout) handled safely by exponential backoff and honest error reporting without leaking credentials.
+- Offline mock mode remains the fully operational, deterministic default.
+
+
