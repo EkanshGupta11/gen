@@ -221,6 +221,31 @@ impl ExecutiveController {
             .values()
             .any(|g| g.status == GoalStatus::Failed);
 
+        // Explicit Primary Synthesis Objective Evaluation
+        let synthesis_goal_opt = self.state.goals.goals.values().find(|g| {
+            g.completion_criteria
+                .iter()
+                .any(|c| matches!(c, CompletionCriterion::SynthesisCompleted))
+        });
+
+        if let Some(synthesis_goal) = synthesis_goal_opt {
+            if synthesis_goal.status == GoalStatus::Completed {
+                if any_goal_cancelled {
+                    self.stop(StopReason::UserCancelled);
+                } else {
+                    self.stop(StopReason::ObjectiveAchieved);
+                }
+                return Ok(Vec::new());
+            } else if synthesis_goal.status == GoalStatus::Cancelled {
+                self.stop(StopReason::UserCancelled);
+                return Ok(Vec::new());
+            } else if synthesis_goal.status == GoalStatus::Failed {
+                // If the primary synthesis objective has failed, the entire investigation cannot achieve its objective
+                self.stop(StopReason::DeadlockNoExecutableActions);
+                return Ok(Vec::new());
+            }
+        }
+
         if all_goals_completed {
             self.stop(StopReason::AllGoalsCompleted);
             return Ok(Vec::new());
@@ -228,23 +253,6 @@ impl ExecutiveController {
 
         if all_goals_cancelled {
             self.stop(StopReason::UserCancelled);
-            return Ok(Vec::new());
-        }
-
-        // If the primary synthesis goal has reached completion, check if any goals were cancelled
-        let synthesis_completed = self.state.goals.goals.values().any(|g| {
-            g.status == GoalStatus::Completed
-                && g.completion_criteria
-                    .iter()
-                    .any(|c| matches!(c, CompletionCriterion::SynthesisCompleted))
-        });
-
-        if synthesis_completed {
-            if any_goal_cancelled {
-                self.stop(StopReason::UserCancelled);
-            } else {
-                self.stop(StopReason::ObjectiveAchieved);
-            }
             return Ok(Vec::new());
         }
 
@@ -625,7 +633,9 @@ impl ExecutiveController {
                     computed_val = json!({
                         "range_m": range,
                         "flight_time_s": flight_time,
-                        "max_height_m": max_height
+                        "max_height_m": max_height,
+                        "assumptions": ["vacuum", "level launch and landing", "constant gravity"],
+                        "units": "SI"
                     });
                 } else if tool == "arithmetic" {
                     if exec_args.as_object().map(|o| o.is_empty()).unwrap_or(true) {
@@ -641,7 +651,12 @@ impl ExecutiveController {
                         "div" if b != 0.0 => a / b,
                         _ => a + b,
                     };
-                    computed_val = json!({"value": val});
+                    computed_val = json!({
+                        "value": val,
+                        "operation": op,
+                        "assumptions": ["exact integer or floating-point arithmetic"],
+                        "units": "dimensionless"
+                    });
                 }
 
                 // Call independent Rust checker with actual computed numbers

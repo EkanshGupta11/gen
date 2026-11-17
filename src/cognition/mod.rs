@@ -33,12 +33,15 @@ pub use working_memory::{
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
-    use crate::contracts::EpistemicStatus;
+    use crate::{
+        contracts::{EpistemicStatus, Specialist},
+        store::Store,
+    };
 
     #[test]
     fn test_working_memory_capacity_and_eviction() {
@@ -1286,5 +1289,821 @@ mod tests {
             GoalStatus::Active,
             "Unrelated goal g2 must NOT be satisfied by g1's tool execution"
         );
+    }
+
+    #[tokio::test]
+    async fn test_deterministic_concurrent_execution_in_batch_order() {
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, oneshot};
+
+        // Channel for deterministic synchronization between concurrent tasks
+        let (tx, rx) = oneshot::channel::<()>();
+        let barrier_tx = Arc::new(Mutex::new(Some(tx)));
+        let barrier_rx = Arc::new(Mutex::new(Some(rx)));
+
+        struct SyncTestProvider {
+            tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+            rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::provider::ModelProvider for SyncTestProvider {
+            async fn complete(
+                &self,
+                req: crate::provider::GenerationRequest,
+                _budget: &crate::provider::RequestBudget,
+            ) -> Result<crate::provider::ModelCompletion, crate::provider::ModelError> {
+                let specialist = req.specialist.unwrap_or(Specialist::Physics);
+                if specialist == Specialist::Physics {
+                    // Task 0 (Physics): Wait for Task 1 (Chemistry) to signal before completing!
+                    let rx_opt = self.rx.lock().await.take();
+                    if let Some(rx) = rx_opt {
+                        let _ = rx.await;
+                    }
+                } else if specialist == Specialist::Chemistry {
+                    // Task 1 (Chemistry): Signal task 0 that task 1 is completing first!
+                    let tx_opt = self.tx.lock().await.take();
+                    if let Some(tx) = tx_opt {
+                        let _ = tx.send(());
+                    }
+                }
+                let report = json!({
+                    "analysis": format!("Completed analysis for {specialist:?}"),
+                    "claims": [],
+                    "tool_calls": [],
+                    "assumptions": ["standard assumptions"],
+                    "uncertainties": [],
+                    "evidence_requirements": []
+                });
+                Ok(crate::provider::ModelCompletion {
+                    content: serde_json::to_string(&report).unwrap(),
+                    usage: None,
+                })
+            }
+            fn settings(&self) -> crate::contracts::ProviderSettings {
+                crate::contracts::ProviderSettings {
+                    model_provider: "sync-mock".into(),
+                    model_name: Some("sync-mock".into()),
+                    memory_provider: "sqlite",
+                    credentials_configured: true,
+                    max_tokens_per_request: 1000,
+                }
+            }
+            fn is_mock(&self) -> bool {
+                true
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("sync_concurrency.sqlite3");
+        let (store, _) = Store::initialize(db_path).unwrap();
+
+        let mut state =
+            CognitiveState::new("inv-sync-order", "Deterministic Concurrency Test", 10, 50);
+
+        let g1 = Goal {
+            id: "g1".into(),
+            description: "Subproblem 1 (Physics)".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SpecialistReportReceived {
+                specialist: "physics".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        let g2 = Goal {
+            id: "g2".into(),
+            description: "Subproblem 2 (Chemistry)".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SpecialistReportReceived {
+                specialist: "chemistry".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        state.goals.add_goal(g1).unwrap();
+        state.goals.add_goal(g2).unwrap();
+
+        state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag1".into(),
+                goal_id: "g1".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: Specialist::Physics,
+                    task: "Physics subproblem".into(),
+                    goal_id: "g1".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+        state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag2".into(),
+                goal_id: "g2".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: Specialist::Chemistry,
+                    task: "Chemistry subproblem".into(),
+                    goal_id: "g2".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+
+        let sync_provider = Arc::new(SyncTestProvider {
+            tx: barrier_tx,
+            rx: barrier_rx,
+        });
+        let budget = Arc::new(crate::provider::RequestBudget::new(1000));
+        let executor = AsyncActionExecutor::new(
+            "python".into(),
+            "engine/app.py".into(),
+            std::time::Duration::from_secs(5),
+            sync_provider,
+            budget,
+        );
+
+        let config = ExecutiveConfig {
+            max_concurrency: 2,
+            ..Default::default()
+        };
+        let store_clone = store.clone();
+        let mut runtime = CognitiveRuntime::from_existing_state(state, config, executor, store);
+
+        // Execute batch: task 1 finishes BEFORE task 0!
+        let stepped = runtime.step().await.unwrap();
+        assert!(stepped);
+
+        // 1. Authoritative batch commit order: Actions committed in order 0 (Physics) then 1 (Chemistry)
+        assert_eq!(runtime.controller.state.executive.total_actions_executed, 2);
+        assert_eq!(
+            runtime.controller.state.executive.remaining_action_budget,
+            48
+        );
+
+        // 2. Events committed in exact batch order (persisted durably to store)
+        let persisted_events = store_clone
+            .get_cognitive_events("inv-sync-order".to_string())
+            .await
+            .unwrap();
+        let executed_events: Vec<_> = persisted_events
+            .iter()
+            .filter(|e| {
+                e.event_type == crate::cognition::events::CognitiveEventType::ActionExecuted
+            })
+            .collect();
+        assert_eq!(executed_events.len(), 2);
+        let payload0 = &executed_events[0].payload;
+        assert_eq!(
+            payload0.get("action").and_then(Value::as_str),
+            Some("request_specialist_analysis")
+        );
+        let payload1 = &executed_events[1].payload;
+        assert_eq!(
+            payload1.get("action").and_then(Value::as_str),
+            Some("request_specialist_analysis")
+        );
+
+        // 3. Goal-scoped evidence isolation: g1 gets physics report, g2 gets chemistry report
+        let g1_items: Vec<_> = runtime
+            .controller
+            .state
+            .knowledge_items
+            .values()
+            .filter(|k| k.related_goals.contains(&"g1".to_string()))
+            .collect();
+        assert_eq!(g1_items.len(), 1);
+        assert_eq!(g1_items[0].provenance.source_id.as_deref(), Some("physics"));
+
+        let g2_items: Vec<_> = runtime
+            .controller
+            .state
+            .knowledge_items
+            .values()
+            .filter(|k| k.related_goals.contains(&"g2".to_string()))
+            .collect();
+        assert_eq!(g2_items.len(), 1);
+        assert_eq!(
+            g2_items[0].provenance.source_id.as_deref(),
+            Some("chemistry")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_execution_failure_handling_and_sibling_preservation() {
+        struct FailureProvider;
+        #[async_trait::async_trait]
+        impl crate::provider::ModelProvider for FailureProvider {
+            async fn complete(
+                &self,
+                req: crate::provider::GenerationRequest,
+                _budget: &crate::provider::RequestBudget,
+            ) -> Result<crate::provider::ModelCompletion, crate::provider::ModelError> {
+                let specialist = req.specialist.unwrap_or(Specialist::Physics);
+                if specialist == Specialist::Chemistry {
+                    // Task 1 fails!
+                    Err(crate::provider::ModelError::Http {
+                        status: 500,
+                        message: "Specialist chemistry engine failed".into(),
+                    })
+                } else {
+                    // Task 0 succeeds!
+                    let report = json!({
+                        "analysis": "Physics analysis ok",
+                        "claims": [],
+                        "tool_calls": [],
+                        "assumptions": ["standard assumptions"],
+                        "uncertainties": [],
+                        "evidence_requirements": []
+                    });
+                    Ok(crate::provider::ModelCompletion {
+                        content: serde_json::to_string(&report).unwrap(),
+                        usage: None,
+                    })
+                }
+            }
+            fn settings(&self) -> crate::contracts::ProviderSettings {
+                crate::contracts::ProviderSettings {
+                    model_provider: "fail-mock".into(),
+                    model_name: Some("fail-mock".into()),
+                    memory_provider: "sqlite",
+                    credentials_configured: true,
+                    max_tokens_per_request: 1000,
+                }
+            }
+            fn is_mock(&self) -> bool {
+                true
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("fail_concurrency.sqlite3");
+        let (store, _) = Store::initialize(db_path).unwrap();
+
+        let mut state =
+            CognitiveState::new("inv-fail-sibling", "Failure Sibling Preservation", 10, 50);
+
+        let g1 = Goal {
+            id: "g1".into(),
+            description: "Subproblem 1 (Physics)".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SpecialistReportReceived {
+                specialist: "physics".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        let g2 = Goal {
+            id: "g2".into(),
+            description: "Subproblem 2 (Chemistry)".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![CompletionCriterion::SpecialistReportReceived {
+                specialist: "chemistry".into(),
+            }],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        state.goals.add_goal(g1).unwrap();
+        state.goals.add_goal(g2).unwrap();
+
+        state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag1".into(),
+                goal_id: "g1".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: Specialist::Physics,
+                    task: "Physics subproblem".into(),
+                    goal_id: "g1".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+        state
+            .goals
+            .add_agenda_item(crate::cognition::goals::AgendaItem {
+                id: "ag2".into(),
+                goal_id: "g2".into(),
+                action: ExecutiveAction::RequestSpecialistAnalysis {
+                    specialist: Specialist::Chemistry,
+                    task: "Chemistry subproblem".into(),
+                    goal_id: "g2".into(),
+                },
+                status: crate::cognition::goals::AgendaStatus::Ready,
+                created_at: "2026-11-17T00:00:00Z".into(),
+            });
+
+        let provider = Arc::new(FailureProvider);
+        let budget = Arc::new(crate::provider::RequestBudget::new(1000));
+        let executor = AsyncActionExecutor::new(
+            "python".into(),
+            "engine/app.py".into(),
+            std::time::Duration::from_secs(5),
+            provider,
+            budget,
+        );
+
+        let config = ExecutiveConfig {
+            max_concurrency: 2,
+            ..Default::default()
+        };
+        let mut runtime = CognitiveRuntime::from_existing_state(state, config, executor, store);
+
+        let stepped = runtime.step().await.unwrap();
+        assert!(stepped);
+
+        // Task 0 succeeded: its evidence is committed to g1
+        assert_eq!(
+            runtime
+                .controller
+                .state
+                .goals
+                .get_goal("g1")
+                .unwrap()
+                .status,
+            GoalStatus::Completed
+        );
+        let g1_items: Vec<_> = runtime
+            .controller
+            .state
+            .knowledge_items
+            .values()
+            .filter(|k| k.related_goals.contains(&"g1".to_string()))
+            .collect();
+        assert_eq!(
+            g1_items.len(),
+            1,
+            "Sibling successful action result must NOT be lost"
+        );
+
+        // Task 1 failed: g2 is marked failed
+        assert_eq!(
+            runtime
+                .controller
+                .state
+                .goals
+                .get_goal("g2")
+                .unwrap()
+                .status,
+            GoalStatus::Failed
+        );
+
+        // Investigation cannot accidentally be Completed
+        assert_ne!(
+            runtime.controller.state.executive.stop_reason,
+            Some(StopReason::AllGoalsCompleted)
+        );
+        assert_ne!(
+            runtime.controller.state.executive.stop_reason,
+            Some(StopReason::ObjectiveAchieved)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canonical_scientific_evidence_schema_production_tool_path() {
+        use crate::cognition::state::check_contradiction_comparability;
+
+        let executor = AsyncActionExecutor::for_testing();
+        let mut state = CognitiveState::new("inv-schema-test", "Evidence Schema Test", 10, 50);
+
+        let goal = Goal {
+            id: "g-phys".into(),
+            description: "Kinematics goal".into(),
+            parent_goal: None,
+            priority: 50,
+            status: GoalStatus::Active,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: vec![],
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+        state.goals.add_goal(goal).unwrap();
+
+        // Obtain real production evidence via actual tool execution path
+        let action = ExecutiveAction::ExecuteScientificTool {
+            tool: "projectile".into(),
+            arguments: json!({"speed": 20.0, "angle_degrees": 35.0}),
+            goal_id: "g-phys".into(),
+        };
+        let outcome = executor.execute(&action, &mut state).await;
+        assert!(outcome.success, "Production tool execution must succeed");
+
+        let mut real_item = state
+            .knowledge_items
+            .values()
+            .find(|k| k.item_type == KnowledgeItemType::Calculation)
+            .expect("Production KnowledgeItem must be generated")
+            .clone();
+        real_item.content["units"] = json!("SI");
+
+        // 1. Exact match with itself must be comparable
+        assert!(check_contradiction_comparability(&real_item, &real_item).is_ok());
+
+        // 2. Contrasting result values with identical conditions, units, assumptions, tool MUST be comparable!
+        let mut contrasting_item = real_item.clone();
+        contrasting_item.id = "calc-contra".into();
+        // Modify the numerical values in output to simulate an empirical contradiction
+        contrasting_item.content["output"]["range_m"] = json!(45.2);
+        contrasting_item.content["output"]["flight_time_s"] = json!(2.8);
+        assert!(
+            check_contradiction_comparability(&real_item, &contrasting_item).is_ok(),
+            "Contradictory result values must NOT prevent comparability!"
+        );
+
+        // 3. Different tool identity
+        let mut diff_tool = real_item.clone();
+        diff_tool.content["tool"] = json!("pendulum");
+        let err = check_contradiction_comparability(&real_item, &diff_tool).unwrap_err();
+        assert!(err.contains("Different tools used"));
+
+        // 4. Missing tool identity
+        let mut missing_tool = real_item.clone();
+        missing_tool.content.as_object_mut().unwrap().remove("tool");
+        let err = check_contradiction_comparability(&real_item, &missing_tool).unwrap_err();
+        assert!(err.contains("Tool or scientific operation specification missing"));
+
+        // 5. Missing arguments
+        let mut missing_args = real_item.clone();
+        missing_args
+            .content
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        let err = check_contradiction_comparability(&real_item, &missing_args).unwrap_err();
+        assert!(err.contains("Condition parameters/arguments missing"));
+
+        // 6. Parameter key set mismatch
+        let mut param_mismatch = real_item.clone();
+        param_mismatch.content["arguments"] = json!({"speed": 20.0});
+        let err = check_contradiction_comparability(&real_item, &param_mismatch).unwrap_err();
+        assert!(err.contains("Mismatched condition parameters"));
+
+        // 7. Parameter numerical input mismatch beyond 1e-4 tolerance
+        let mut num_mismatch = real_item.clone();
+        num_mismatch.content["arguments"]["speed"] = json!(25.0);
+        let err = check_contradiction_comparability(&real_item, &num_mismatch).unwrap_err();
+        assert!(err.contains("Condition parameter mismatch for 'speed'"));
+
+        // 8. Parameter numerical input within 1e-4 tolerance
+        let mut tolerance_item = real_item.clone();
+        tolerance_item.content["arguments"]["speed"] = json!(20.00005);
+        assert!(check_contradiction_comparability(&real_item, &tolerance_item).is_ok());
+
+        // 9. Missing units (removal of units and unit-bearing output suffixes)
+        let mut missing_units = real_item.clone();
+        missing_units
+            .content
+            .as_object_mut()
+            .unwrap()
+            .remove("units");
+        missing_units.content["output"] =
+            json!({"unspecified_result": 38.33, "assumptions": ["vacuum"]});
+        let err = check_contradiction_comparability(&real_item, &missing_units).unwrap_err();
+        assert!(err.contains("Units specification missing"));
+
+        // 10. Incompatible units
+        let mut incomp_units = real_item.clone();
+        incomp_units.content["units"] = json!("imperial_feet");
+        let err = check_contradiction_comparability(&real_item, &incomp_units).unwrap_err();
+        assert!(err.contains("Incompatible units"));
+
+        // 11. Missing assumptions
+        let mut missing_assumptions = real_item.clone();
+        missing_assumptions.content["output"]
+            .as_object_mut()
+            .unwrap()
+            .remove("assumptions");
+        let err = check_contradiction_comparability(&real_item, &missing_assumptions).unwrap_err();
+        assert!(err.contains("Explicit scientific assumptions missing"));
+
+        // 12. Conflicting physical assumptions: air drag vs vacuum
+        let mut drag_assumptions = real_item.clone();
+        drag_assumptions.content["output"]["assumptions"] =
+            json!(["air drag", "viscous resistance"]);
+        let err = check_contradiction_comparability(&real_item, &drag_assumptions).unwrap_err();
+        assert!(err.contains("air resistance vs ideal vacuum"));
+
+        // 13. Conflicting model assumptions: relativistic vs classical
+        let mut rel_item = real_item.clone();
+        rel_item.content["output"]["assumptions"] = json!(["special relativity", "lorentz frame"]);
+        let mut class_item = real_item.clone();
+        class_item.content["output"]["assumptions"] = json!(["classical mechanics", "newtonian"]);
+        let err = check_contradiction_comparability(&rel_item, &class_item).unwrap_err();
+        assert!(err.contains("Conflicting model assumptions"));
+
+        // 14. Different output quantity keys (e.g. range_m vs max_height_m)
+        let mut diff_output_quantity = real_item.clone();
+        diff_output_quantity.content["output"] = json!({
+            "max_height_m": 12.5,
+            "assumptions": ["vacuum", "level launch and landing", "constant gravity"]
+        });
+        let err = check_contradiction_comparability(&real_item, &diff_output_quantity).unwrap_err();
+        assert!(err.contains("Different output measured quantities"));
+
+        // 15. Missing output field
+        let mut missing_output = real_item.clone();
+        missing_output.content["assumptions"] =
+            json!(["vacuum", "level launch and landing", "constant gravity"]);
+        missing_output
+            .content
+            .as_object_mut()
+            .unwrap()
+            .remove("output");
+        let err = check_contradiction_comparability(&real_item, &missing_output).unwrap_err();
+        assert!(err.contains("Output result field missing"));
+
+        // 16. Malformed output structure (boolean)
+        let mut malformed_output = real_item.clone();
+        malformed_output.content["assumptions"] =
+            json!(["vacuum", "level launch and landing", "constant gravity"]);
+        malformed_output.content["output"] = json!(true);
+        let err = check_contradiction_comparability(&real_item, &malformed_output).unwrap_err();
+        assert!(err.contains("Malformed output structure"));
+
+        // 17. Routing through ContradictionResolution: incompatible evidence routes to RequiresHumanReview
+        state.record_contradiction(
+            "contra-real-test",
+            "Real production tool contradiction",
+            vec![real_item.id.clone(), diff_tool.id.clone()],
+        );
+        state.add_knowledge_item(diff_tool);
+
+        let resolve_action = ExecutiveAction::ResolveContradiction {
+            contradiction_id: "contra-real-test".into(),
+            resolution_strategy: "deterministic_verification_arbitration".into(),
+        };
+        let resolve_outcome = executor.execute(&resolve_action, &mut state).await;
+        assert_eq!(resolve_outcome.status, ActionExecutionStatus::Uncertain);
+        assert!(!state.contradictions[0].resolved);
+        assert_eq!(
+            state.contradictions[0].resolution.as_ref().unwrap().outcome,
+            ResolutionOutcome::RequiresHumanReview
+        );
+    }
+
+    #[test]
+    fn test_terminal_status_synthesis_and_subproblem_semantics() {
+        use crate::orchestrator::map_stop_reason_to_investigation_outcome;
+
+        let make_goal = |id: &str, status: GoalStatus, is_synthesis: bool| Goal {
+            id: id.into(),
+            description: format!("Goal {id}"),
+            parent_goal: None,
+            priority: 50,
+            status,
+            dependencies: vec![],
+            preconditions: vec![],
+            completion_criteria: if is_synthesis {
+                vec![CompletionCriterion::SynthesisCompleted]
+            } else {
+                vec![CompletionCriterion::ToolExecuted {
+                    tool_name: "test".into(),
+                }]
+            },
+            created_at: "2026-11-17T00:00:00Z".into(),
+            completed_at: None,
+        };
+
+        // 1. Successful synthesis with an isolated failed subproblem -> Completed
+        {
+            let mut controller = ExecutiveController::new(
+                "inv-synth-ok-sub-fail",
+                "Test",
+                ExecutiveConfig::default(),
+            );
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-1", GoalStatus::Failed, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-2", GoalStatus::Completed, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("synth", GoalStatus::Completed, true))
+                .unwrap();
+
+            let batch = controller.step_prepare_batch(1).unwrap();
+            assert!(batch.is_empty());
+            assert_eq!(
+                controller.state.executive.stop_reason,
+                Some(StopReason::ObjectiveAchieved)
+            );
+
+            let (status, err) = map_stop_reason_to_investigation_outcome(
+                controller.state.executive.stop_reason.as_ref(),
+                false, // all_goals_genuinely_completed is false because sub-1 failed
+                false, // any_goal_cancelled is false
+                true,  // any_goal_failed is true
+            );
+            assert_eq!(status, crate::contracts::InvestigationStatus::Completed);
+            assert!(
+                err.is_none(),
+                "Genuinely completed synthesis with isolated subproblem failure must succeed"
+            );
+        }
+
+        // 2. Failed synthesis with completed subproblem -> Failed
+        {
+            let mut controller = ExecutiveController::new(
+                "inv-synth-fail-sub-ok",
+                "Test",
+                ExecutiveConfig::default(),
+            );
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-1", GoalStatus::Completed, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("synth", GoalStatus::Failed, true))
+                .unwrap();
+
+            let batch = controller.step_prepare_batch(1).unwrap();
+            assert!(batch.is_empty());
+            assert_eq!(
+                controller.state.executive.stop_reason,
+                Some(StopReason::DeadlockNoExecutableActions)
+            );
+
+            let (status, err) = map_stop_reason_to_investigation_outcome(
+                controller.state.executive.stop_reason.as_ref(),
+                false,
+                false,
+                true,
+            );
+            assert_eq!(status, crate::contracts::InvestigationStatus::Failed);
+            assert!(err.is_some());
+        }
+
+        // 3. Cancelled synthesis -> Interrupted
+        {
+            let mut controller =
+                ExecutiveController::new("inv-synth-cancelled", "Test", ExecutiveConfig::default());
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-1", GoalStatus::Completed, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("synth", GoalStatus::Cancelled, true))
+                .unwrap();
+
+            let batch = controller.step_prepare_batch(1).unwrap();
+            assert!(batch.is_empty());
+            assert_eq!(
+                controller.state.executive.stop_reason,
+                Some(StopReason::UserCancelled)
+            );
+
+            let (status, err) = map_stop_reason_to_investigation_outcome(
+                controller.state.executive.stop_reason.as_ref(),
+                false,
+                true,
+                false,
+            );
+            assert_eq!(status, crate::contracts::InvestigationStatus::Interrupted);
+            assert!(err.is_some());
+        }
+
+        // 4. Completed child goal without completed synthesis -> Does not terminate
+        {
+            let mut controller = ExecutiveController::new(
+                "inv-child-done-synth-pending",
+                "Test",
+                ExecutiveConfig::default(),
+            );
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-1", GoalStatus::Completed, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-2", GoalStatus::Active, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("synth", GoalStatus::Pending, true))
+                .unwrap();
+
+            controller
+                .state
+                .goals
+                .add_agenda_item(crate::cognition::goals::AgendaItem {
+                    id: "ag-sub-2".into(),
+                    goal_id: "sub-2".into(),
+                    action: ExecutiveAction::ExecuteScientificTool {
+                        tool: "projectile".into(),
+                        arguments: json!({}),
+                        goal_id: "sub-2".into(),
+                    },
+                    status: crate::cognition::goals::AgendaStatus::Ready,
+                    created_at: "2026-11-17T00:00:00Z".into(),
+                });
+
+            let batch = controller.step_prepare_batch(1).unwrap();
+            assert_eq!(
+                batch.len(),
+                1,
+                "Completed child goal must NOT terminate executive; remaining goals must proceed"
+            );
+            assert!(
+                controller.state.executive.stop_reason.is_none(),
+                "Executive must not stop prematurely"
+            );
+        }
+
+        // 5. All goals completed -> Completed
+        {
+            let mut controller =
+                ExecutiveController::new("inv-all-complete", "Test", ExecutiveConfig::default());
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-1", GoalStatus::Completed, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-2", GoalStatus::Completed, false))
+                .unwrap();
+
+            let batch = controller.step_prepare_batch(1).unwrap();
+            assert!(batch.is_empty());
+            assert_eq!(
+                controller.state.executive.stop_reason,
+                Some(StopReason::AllGoalsCompleted)
+            );
+
+            let (status, err) = map_stop_reason_to_investigation_outcome(
+                controller.state.executive.stop_reason.as_ref(),
+                true,
+                false,
+                false,
+            );
+            assert_eq!(status, crate::contracts::InvestigationStatus::Completed);
+            assert!(err.is_none());
+        }
+
+        // 6. All goals cancelled -> Interrupted
+        {
+            let mut controller =
+                ExecutiveController::new("inv-all-cancelled", "Test", ExecutiveConfig::default());
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-1", GoalStatus::Cancelled, false))
+                .unwrap();
+            controller
+                .state
+                .goals
+                .add_goal(make_goal("sub-2", GoalStatus::Cancelled, false))
+                .unwrap();
+
+            let batch = controller.step_prepare_batch(1).unwrap();
+            assert!(batch.is_empty());
+            assert_eq!(
+                controller.state.executive.stop_reason,
+                Some(StopReason::UserCancelled)
+            );
+
+            let (status, err) = map_stop_reason_to_investigation_outcome(
+                controller.state.executive.stop_reason.as_ref(),
+                false,
+                true,
+                false,
+            );
+            assert_eq!(status, crate::contracts::InvestigationStatus::Interrupted);
+            assert!(err.is_some());
+        }
     }
 }

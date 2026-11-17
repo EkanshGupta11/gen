@@ -1,6 +1,6 @@
 use crate::{
     cognition::{
-        actions::ExecutiveAction,
+        actions::{ActionResult, ExecutiveAction},
         executive::{ExecutiveConfig, ExecutiveController},
         executor::AsyncActionExecutor,
         state::{CognitiveState, ExecutivePhase},
@@ -99,60 +99,129 @@ impl CognitiveRuntime {
             return Ok(!self.controller.state.is_stopped());
         }
 
-        // Bounded concurrent execution across worker tasks
+        // Bounded concurrent execution across worker tasks with deterministic batch commit order
         self.controller.state.executive.current_phase = ExecutivePhase::ExecuteAction;
+        let batch_len = batch.len();
+        let batch_actions = batch.clone();
         let mut join_set = tokio::task::JoinSet::new();
-        for action in batch {
+        let mut task_id_to_idx = std::collections::HashMap::new();
+
+        for (batch_idx, action) in batch.into_iter().enumerate() {
             let exec = self.executor.clone();
             let act = action.clone();
             let mut state_clone = self.controller.state.clone();
-            join_set.spawn(async move {
+            let handle = join_set.spawn(async move {
                 let outcome = exec.execute(&act, &mut state_clone).await;
-                (act, outcome, state_clone)
+                (batch_idx, act, outcome, state_clone)
             });
+            task_id_to_idx.insert(handle.id(), batch_idx);
         }
+
+        // Collect concurrent execution results indexed by original batch position
+        let mut collected: Vec<Option<(ExecutiveAction, ActionResult, Option<CognitiveState>)>> =
+            (0..batch_len).map(|_| None).collect();
 
         while let Some(res) = join_set.join_next().await {
             match res {
-                Ok((act, outcome, task_state)) => {
-                    let target_goal = act.associated_goal_id().map(|s| s.to_string());
-                    // Durably merge any knowledge items produced by the concurrent task scoped strictly to the target goal
-                    for (id, item) in task_state.knowledge_items {
-                        if !self.controller.state.knowledge_items.contains_key(&id) {
-                            let belongs_to_goal = match &target_goal {
-                                Some(gid) => item.related_goals.contains(gid),
-                                None => true,
-                            };
-                            if belongs_to_goal {
-                                self.controller.state.add_knowledge_item(item);
-                            }
-                        }
-                    }
-                    // Sync goal failure if worker task recorded a failed status for its target goal
-                    if let Some(ref gid) = target_goal
-                        && let Some(task_goal) = task_state.goals.get_goal(gid)
-                        && task_goal.status == crate::cognition::GoalStatus::Failed
-                        && let Some(auth_goal) = self.controller.state.goals.get_goal_mut(gid)
-                    {
-                        auth_goal.status = crate::cognition::GoalStatus::Failed;
-                    }
-                    // Merge any new contradictions detected during the task
-                    for contradiction in task_state.contradictions {
-                        if !self
-                            .controller
-                            .state
-                            .contradictions
-                            .iter()
-                            .any(|c| c.id == contradiction.id)
-                        {
-                            self.controller.state.contradictions.push(contradiction);
-                        }
-                    }
-                    self.controller.step_commit(&act, outcome)?;
+                Ok((batch_idx, act, outcome, task_state)) => {
+                    collected[batch_idx] = Some((act, outcome, Some(task_state)));
                 }
-                Err(e) => return Err(format!("Concurrent action task failed: {e}")),
+                Err(join_err) => {
+                    let task_id = join_err.id();
+                    let failed_idx = task_id_to_idx
+                        .get(&task_id)
+                        .copied()
+                        .or_else(|| collected.iter().position(|slot| slot.is_none()));
+
+                    if let Some(idx) = failed_idx {
+                        let act = batch_actions[idx].clone();
+                        let err_msg = if join_err.is_panic() {
+                            format!(
+                                "Concurrent task at batch index {idx} panicked during execution"
+                            )
+                        } else if join_err.is_cancelled() {
+                            format!("Concurrent task at batch index {idx} was cancelled")
+                        } else {
+                            format!("Concurrent task at batch index {idx} failed: {join_err}")
+                        };
+                        let outcome = ActionResult::failed(
+                            uuid::Uuid::new_v4().to_string(),
+                            act.name(),
+                            err_msg,
+                            0,
+                        );
+                        collected[idx] = Some((act, outcome, None));
+                    }
+                }
             }
         }
+
+        // Commit all action outcomes in strict original batch order
+        for (idx, slot) in collected.into_iter().enumerate() {
+            let (act, outcome, task_state_opt) = match slot {
+                Some(data) => data,
+                None => {
+                    let act = batch_actions[idx].clone();
+                    let outcome = ActionResult::failed(
+                        uuid::Uuid::new_v4().to_string(),
+                        act.name(),
+                        format!("Task at batch index {idx} missing result"),
+                        0,
+                    );
+                    (act, outcome, None)
+                }
+            };
+
+            let target_goal = act.associated_goal_id().map(|s| s.to_string());
+            if let Some(task_state) = task_state_opt {
+                // Durably merge any knowledge items produced by the concurrent task scoped strictly to the target goal
+                for (id, item) in task_state.knowledge_items {
+                    if !self.controller.state.knowledge_items.contains_key(&id) {
+                        let belongs_to_goal = match &target_goal {
+                            Some(gid) => item.related_goals.contains(gid),
+                            None => true,
+                        };
+                        if belongs_to_goal {
+                            self.controller.state.add_knowledge_item(item);
+                        }
+                    }
+                }
+                // Sync goal failure if worker task recorded a failed status for its target goal
+                if let Some(ref gid) = target_goal
+                    && let Some(task_goal) = task_state.goals.get_goal(gid)
+                    && task_goal.status == crate::cognition::GoalStatus::Failed
+                    && let Some(auth_goal) = self.controller.state.goals.get_goal_mut(gid)
+                {
+                    auth_goal.status = crate::cognition::GoalStatus::Failed;
+                }
+                // Merge any new contradictions detected during the task
+                for contradiction in task_state.contradictions {
+                    if !self
+                        .controller
+                        .state
+                        .contradictions
+                        .iter()
+                        .any(|c| c.id == contradiction.id)
+                    {
+                        self.controller.state.contradictions.push(contradiction);
+                    }
+                }
+            } else {
+                // Task failed without valid state; mark goal failed in authoritative state
+                if let Some(ref gid) = target_goal
+                    && let Some(auth_goal) = self.controller.state.goals.get_goal_mut(gid)
+                {
+                    auth_goal.status = crate::cognition::GoalStatus::Failed;
+                }
+            }
+
+            // Commit outcome authoritatively
+            let continue_exec = self.controller.step_commit(&act, outcome)?;
+            if !continue_exec || self.controller.state.is_stopped() {
+                break;
+            }
+        }
+
         self.persist_state_and_events().await?;
         Ok(!self.controller.state.is_stopped())
     }

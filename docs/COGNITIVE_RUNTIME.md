@@ -200,4 +200,42 @@ Milestone 1.3.2.1 eliminates executive bypass vulnerabilities and hardens verifi
 - Documented model catalog availability (`models/gemini-3.8-flash`, `models/gemini-flash-latest`) and upstream cloud demand responses (HTTP 503 / timeout) handled safely by exponential backoff and honest error reporting without leaking credentials.
 - Offline mock mode remains the fully operational, deterministic default.
 
+---
+
+## 9. Milestone 1.3.2.2 Deterministic Execution & Canonical Evidence Schema Closure
+
+Milestone 1.3.2.2 establishes deterministic concurrent execution semantics and closes the canonical scientific evidence schema:
+
+### 9.1 Deterministic Concurrent Execution in Batch Order (`src/cognition/runtime.rs`)
+- **Eliminated Out-of-Order Commits**: `CognitiveRuntime` previously committed Tokio task results as they completed via `JoinSet::join_next()`. Completion timing varied across runs, leading to non-deterministic state ordering and non-reproducible cognitive event logs.
+- **Batch Indexing & Indexed Collection**:
+  - Each action in a batch is assigned a stable index `0..batch.len()`.
+  - Tokio task results are collected into a pre-allocated `Vec<Option<...>>` indexed by original batch position.
+  - Handled `JoinError` (panics, task cancellation) explicitly by inserting a deterministic failed `ActionResult` with a descriptive error message without discarding results from sibling tasks.
+- **Strict Sequential Commit Order**:
+  - Results are committed strictly in original batch order `0..batch.len()`.
+  - Authoritative working memory updates, goal-scoped knowledge merges, loop detection histories, and SQLite cognitive events are 100% deterministic and reproducible across repeated runs.
+
+### 9.2 Canonical Scientific Evidence Schema (`src/cognition/state.rs`)
+`check_contradiction_comparability` strictly enforces the canonical scientific evidence schema:
+1. **Explicit Tool Identity**: Both items must specify a concrete tool/operation name (e.g., `projectile_motion`). Fallback to specialist domain strings (e.g., `physics`) is rejected; mismatched tools fail closed.
+2. **Deep Condition Comparison**: Compares the complete input parameter set. Numerical parameters are compared within a strict tolerance of $10^{-4}$; non-numeric parameters must match exactly.
+3. **Explicit Units & Suffix Inference**:
+   - Unit metadata must be present at top-level, arguments, or output map.
+   - Automatically infers standard units from output key suffixes (`_m` $\to$ `m`, `_s` $\to$ `s`, `_m_s` $\to$ `m/s`, `_j` $\to$ `J`, `_kg` $\to$ `kg`, `_rad` $\to$ `rad`, `_deg` $\to$ `deg`).
+   - Missing or incompatible units fail closed to `ResolutionOutcome::RequiresHumanReview`.
+4. **Explicit Non-Empty Assumptions**:
+   - Both items must have non-empty assumptions traced from item payload, output dictionaries, or argument specifications.
+   - Conflicting physical assumptions (vacuum vs air drag), model assumptions (relativistic vs classical), thermodynamic assumptions (isothermal vs adiabatic), or fluid assumptions (laminar vs turbulent) fail comparability.
+5. **Output Measured Quantity Identity**:
+   - Verifies that both items measure the exact same set of physical quantity keys (e.g., `range_m`, `flight_time_s`, `max_height_m`) without requiring the contradictory numeric values to agree.
+6. **Fail-Closed Contradiction Arbitration**: Incomparable or ambiguous evidence routes to `ResolutionOutcome::RequiresHumanReview` with `resolved = false`.
+
+### 9.3 Terminal Status & Primary Objective Semantics (`src/cognition/executive.rs`)
+- In multi-step investigations, evaluated whether the primary synthesis objective has succeeded. A completed synthesis objective marks the investigation `Completed` even if an isolated, non-critical subproblem failed.
+- A failed primary synthesis objective never reports `Completed`.
+- Cancelled goals preserve `InvestigationStatus::Interrupted`.
+- Arbitrary completed child goals do not prematurely terminate parent goals or the entire investigation.
+
+
 
